@@ -1,4 +1,4 @@
-$ErrorActionPreference = "Stop"
+﻿$ErrorActionPreference = "Stop"
 $Root = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $Red = [ConsoleColor]::Red
 $Pink = [ConsoleColor]::Magenta
@@ -86,11 +86,9 @@ if ($Missing.Count -gt 0) {
     Show-Frame "02  /  DÉPENDANCES" "Node.js · Rust · MSVC · WebView2 déjà installés"
 }
 
-$env:Path = @(
-    $env:Path
-    (Join-Path $env:USERPROFILE ".cargo\bin")
-    (Join-Path $env:ProgramFiles "nodejs")
-) -join [System.IO.Path]::PathSeparator
+$CargoBin = Join-Path $env:USERPROFILE ".cargo\bin"
+$NodeBin = Join-Path $env:ProgramFiles "nodejs"
+$env:Path = $env:Path + ";" + $CargoBin + ";" + $NodeBin
 if (-not (Get-Command npm -ErrorAction SilentlyContinue)) {
     throw "npm est toujours introuvable après l’installation. Ferme et rouvre PowerShell, puis relance scripts/install.ps1."
 }
