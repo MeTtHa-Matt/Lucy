@@ -44,6 +44,10 @@ function Invoke-WingetInstall([string]$Id, [string]$ExtraArgs = "") {
     }
 }
 
+$CargoBin = Join-Path $env:USERPROFILE ".cargo\bin"
+$NodeBin = Join-Path $env:ProgramFiles "nodejs"
+$env:Path = $env:Path + ";" + $CargoBin + ";" + $NodeBin
+
 Show-Frame "01  /  ENVIRONNEMENT" "Windows · vérification des dépendances"
 $Missing = [System.Collections.Generic.List[string]]::new()
 if (-not (Get-Command node -ErrorAction SilentlyContinue)) { $Missing.Add("OpenJS.NodeJS.LTS") }
@@ -86,9 +90,6 @@ if ($Missing.Count -gt 0) {
     Show-Frame "02  /  DÉPENDANCES" "Node.js · Rust · MSVC · WebView2 déjà installés"
 }
 
-$CargoBin = Join-Path $env:USERPROFILE ".cargo\bin"
-$NodeBin = Join-Path $env:ProgramFiles "nodejs"
-$env:Path = $env:Path + ";" + $CargoBin + ";" + $NodeBin
 if (-not (Get-Command npm -ErrorAction SilentlyContinue)) {
     throw "npm est toujours introuvable après l’installation. Ferme et rouvre PowerShell, puis relance scripts/install.ps1."
 }
