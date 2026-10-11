@@ -4,6 +4,16 @@ Application de bureau autonome pour Arch Linux et Hyprland. Le chat et les répo
 
 ## Installation sur Arch Linux
 
+L’installateur interactif vérifie les dépendances et propose leur installation avant de compiler LUCY. Sous Linux ou macOS, lance :
+
+```sh
+bash scripts/install.sh
+```
+
+Sous Windows, lance `scripts/install.bat` depuis l’Explorateur ou PowerShell. L’installateur utilise `winget` après confirmation pour les outils manquants. Sur Linux, il détecte la distribution, le gestionnaire de paquets et l’environnement de bureau.
+
+Après la compilation, l’installateur demande le prénom ou surnom à utiliser dans les conversations. Il est conservé localement et peut ensuite être modifié dans l’application. Si le projet est déjà compilé manuellement, les prérequis et commandes d’installation ci-dessous restent disponibles.
+
 Installe les dépendances de compilation et bibliothèques graphiques :
 
 ```sh
@@ -39,12 +49,14 @@ Les identifiants LUCY sont stockés dans son dossier de configuration local avec
 ## Capacités disponibles
 
 - Conversations locales, sélection de fournisseur/modèle et conservation de l’historique.
+- Condensation automatique du contexte de session : quand l’historique approche une limite estimée, LUCY demande au modèle connecté un résumé persistant et garde les échanges récents intacts. En cas de refus explicite pour dépassement de contexte, elle condense davantage puis réessaie automatiquement. L’historique complet reste visible et sauvegardé localement ; seul le contexte envoyé au modèle est résumé.
 - Au lancement, ouverture directe de `/home/Matthew` et création d’une nouvelle session. Le dossier de projet reste modifiable depuis la barre latérale.
 - Sélecteur de modèle et modes `Build`, `Plan` (lecture seule) et `Discussion` (sans outils) dans la barre de saisie.
 - Réponses diffusées en direct mot par mot, erreurs de fournisseur explicites et appels d’outils jusqu’à huit tours. Les erreurs temporaires HTTP 429/500/502/503/504 et les erreurs réseau déclenchent jusqu’à dix nouvelles tentatives avec compte à rebours visible, délai exponentiel (de 2 à 300 secondes) et prise en compte de l’en-tête `Retry-After` ; les erreurs permanentes ne sont pas répétées. Les métadonnées de fournisseur renvoyées avec les appels d’outils, dont les signatures de pensée Gemini, sont conservées et retransmises pour que les tours d’outils restent valides.
 - Arrêt d’une génération depuis le bouton carré ou avec `Échap` ; clic gauche ou droit sur un message utilisateur pour le modifier et le renvoyer, le copier ou supprimer ce message et la suite de l’historique.
-- Contexte de projet visible dans le chat : arborescence limitée à 2 000 fichiers, instructions `AGENTS.md` / Copilot et manifestes racine usuels.
-- Gestion des skills au format Claude Code dans `.claude/skills/<nom>/SKILL.md` : création depuis l’interface, import d’un dossier de skill avec ses ressources et suppression. Les instructions des skills du projet sont transmises dans le contexte système, quel que soit le fournisseur ou le modèle compatible OpenAI sélectionné.
+- Contexte de projet visible dans le chat : aperçu borné à 80 chemins et 3 000 caractères d’instructions `AGENTS.md` / Copilot ; les manifestes et autres fichiers sont lus à la demande.
+- Gestion des skills au format Claude Code dans `.claude/skills/<nom>/SKILL.md` : création depuis l’interface, import d’un dossier de skill avec ses ressources et suppression. Seuls les noms/descriptions des 12 premiers skills sont inclus au départ ; les instructions complètes d’un skill pertinent sont lues à la demande dans tous les modes et ne sont pas conservées dans l’historique envoyé aux requêtes suivantes. En mode Discussion, ce chargement ciblé est le seul outil autorisé.
+- Persona LUCY cohérente, concise et familière, indépendante du fournisseur et du modèle sélectionné. Le prénom choisi est inclus dans les instructions système.
 - Lecture de fichiers et exploration du projet ; les chemins restent limités au dossier de travail, et les dossiers d’identifiants et fichiers de secrets sont exclus.
 - Écriture de fichier et commandes shell après confirmation ponctuelle dans LUCY, avec option d’autorisation pour toute la session. Les commandes sont limitées à 60 secondes et leur sortie à 20 000 caractères.
 - Les appels d’outils, leurs arguments, leur sortie et le texte du modèle sont affichés dans l’ordre de la conversation, y compris pendant l’exécution. LUCY demande au modèle des justifications concises et vérifiables ; les chaînes de pensée internes privées ne sont pas exposées.

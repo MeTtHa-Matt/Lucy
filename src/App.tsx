@@ -13,6 +13,7 @@ type Provider = {
   accessTokenExpiresAt?: number;
   modelsError?: string;
 };
+
 type ChatMessage = {
   id: string;
   role: string;
@@ -61,11 +62,12 @@ type AppState = {
   sessions: Session[];
   selectedProviderId: string | null;
   selectedModelId: string | null;
+  userName: string | null;
 };
 type ChatUpdate = {
   sessionId: string;
   messageId: string;
-  kind: "user" | "delta" | "round" | "done" | "stopped" | "error" | "retry" | "context" | "tool_start" | "tool_result";
+  kind: "user" | "delta" | "round" | "done" | "stopped" | "error" | "retry" | "context" | "compacting" | "compacted" | "tool_start" | "tool_result";
   delta: string;
   error?: string;
   details?: Record<string, unknown>;
@@ -90,7 +92,7 @@ const friendlyError = (error: unknown) => error instanceof Error ? error.message
 
 function App() {
   const [appState, setAppState] = useState<AppState>({
-    projectPath: null, providers: [], sessions: [], selectedProviderId: null, selectedModelId: null,
+    projectPath: null, providers: [], sessions: [], selectedProviderId: null, selectedModelId: null, userName: null,
   });
   const [sessionId, setSessionId] = useState("");
   const [providerId, setProviderId] = useState("");
@@ -115,6 +117,9 @@ function App() {
   const [filePath, setFilePath] = useState("");
   const [fileContent, setFileContent] = useState("");
   const [showProvider, setShowProvider] = useState(false);
+  const [showNameDialog, setShowNameDialog] = useState(false);
+  const [userNameInput, setUserNameInput] = useState("");
+  const [savingUserName, setSavingUserName] = useState(false);
   const [showSkills, setShowSkills] = useState(false);
   const [skills, setSkills] = useState<ProjectSkill[]>([]);
   const [skillsBusy, setSkillsBusy] = useState(false);
@@ -128,6 +133,7 @@ function App() {
   const [liveTimeline, setLiveTimeline] = useState<TimelineSegment[]>([]);
   const [projectContext, setProjectContext] = useState<ProjectContext | null>(null);
   const [contextLoading, setContextLoading] = useState(false);
+  const [contextCompacting, setContextCompacting] = useState(false);
   const chatScroll = useRef<HTMLDivElement>(null);
   const messageMenuRef = useRef<HTMLDivElement>(null);
   const stickToChatBottom = useRef(true);
@@ -139,6 +145,7 @@ function App() {
   const projectPath = appState.projectPath ?? "";
   const currentSession = appState.sessions.find((session) => session.id === sessionId);
   const currentProvider = appState.providers.find((provider) => provider.id === providerId);
+  const currentUserName = appState.userName?.trim() ?? "";
   const visibleSessions = useMemo(
     () => appState.sessions.filter((session) => session.title.toLowerCase().includes(search.toLowerCase())),
     [appState.sessions, search],
@@ -159,6 +166,11 @@ function App() {
     setFilePath(path);
     setFileContent("");
   }, [projectPath]);
+
+  useEffect(() => {
+    if (ready && !currentUserName) setShowNameDialog(true);
+    if (currentUserName) setUserNameInput(currentUserName);
+  }, [currentUserName, ready]);
 
   const refreshExplorer = useCallback(async () => {
     if (!projectPath) return;
@@ -348,6 +360,10 @@ function App() {
       } else if (update.kind === "context") {
         setProjectContext(update.details as unknown as ProjectContext);
         setContextLoading(false);
+      } else if (update.kind === "compacting") {
+        setContextCompacting(true);
+      } else if (update.kind === "compacted") {
+        setContextCompacting(false);
       } else if (update.kind === "tool_start") {
         streamedEvents.current.push({
           kind: "tool_start",
@@ -365,6 +381,7 @@ function App() {
         });
         void refreshExplorer().catch((reason: unknown) => setError(friendlyError(reason)));
       } else if (update.kind === "delta") {
+        setContextCompacting(false);
         setRetryStatus(null);
         lastStreamMessageId.current = update.messageId;
         const combined = incompleteWord.current + update.delta;
@@ -400,6 +417,7 @@ function App() {
           });
         }
       } else if (update.kind === "stopped") {
+        setContextCompacting(false);
         setRetryStatus(null);
         streamedEvents.current = [];
         incompleteWord.current = "";
@@ -413,6 +431,7 @@ function App() {
           setLiveTimeline([]);
         }).catch((reason: unknown) => setError(friendlyError(reason)));
       } else if (update.kind === "done") {
+        setContextCompacting(false);
         setRetryStatus(null);
         if (incompleteWord.current) {
           streamedEvents.current.push({
@@ -424,6 +443,7 @@ function App() {
         }
         streamComplete.current = true;
       } else if (update.kind === "error") {
+        setContextCompacting(false);
         setRetryStatus(null);
         streamedEvents.current = [];
         incompleteWord.current = "";
@@ -487,6 +507,22 @@ function App() {
       setError("");
     } catch (reason) {
       setError(friendlyError(reason));
+    }
+  };
+
+  const saveUserName = async (event: React.FormEvent) => {
+    event.preventDefault();
+    setSavingUserName(true);
+    try {
+      const updated = await invoke<AppState>("set_user_name", { userName: userNameInput });
+      setAppState(updated);
+      setShowNameDialog(false);
+      setNotice(`C’est noté, ${updated.userName}.`);
+      setError("");
+    } catch (reason) {
+      setError(friendlyError(reason));
+    } finally {
+      setSavingUserName(false);
     }
   };
 
@@ -780,12 +816,14 @@ function App() {
     streamComplete.current = false;
     setProjectContext(null);
     setContextLoading(true);
+    setContextCompacting(false);
     setInput("");
     setBusy(true);
     try {
       await invoke("send_message", { sessionId, text, providerId, modelId, mode });
     } catch (reason) {
       setError(friendlyError(reason));
+      setContextCompacting(false);
       streamedEvents.current = [];
       incompleteWord.current = "";
       streamComplete.current = false;
@@ -1030,8 +1068,6 @@ function App() {
       <header className="titlebar" data-tauri-drag-region>
         <div className="brand-lockup" data-tauri-drag-region>
           <span className="brand-mark">L</span><span className="brand-name">LUCY</span>
-          <span className="brand-divider">/</span><span className="brand-subtitle">NEURAL INTERFACE</span>
-          <span className="version-tag">STANDALONE</span>
         </div>
         <div className="window-controls">
           <button aria-label="Réduire" onClick={() => void windowControls?.minimize()}>−</button>
@@ -1062,6 +1098,7 @@ function App() {
           </nav>
           <div className="sidebar-bottom">
             <div className="provider-status"><span className="status-led" /><span>{appState.providers.length} FOURNISSEUR{appState.providers.length === 1 ? "" : "S"} LOCAL{appState.providers.length === 1 ? "" : "AUX"}</span></div>
+            <button className="settings-button" onClick={() => setShowNameDialog(true)}><span>◉</span> TON NOM · {currentUserName || "À CONFIGURER"}</button>
             <button className="settings-button" onClick={() => setShowProvider(true)}><span>＋</span> FOURNISSEURS & MODÈLES</button>
           </div>
         </aside>
@@ -1076,6 +1113,19 @@ function App() {
           </div>
 
           {(error || notice || retryStatus) && <div className={retryStatus && !error ? "error-banner retry-banner" : error ? "error-banner" : "notice-banner"} role="status" aria-live="polite"><span>{retryStatus && !error ? `${currentProvider?.name ?? "Fournisseur"} temporairement indisponible (${retryStatus.reason}). Nouvelle tentative ${retryStatus.attempt}/${retryStatus.maxRetries} dans ${Math.max(0, Math.ceil((retryStatus.retryAt - retryClock) / 1000))} s…` : error || notice}</span><button onClick={() => { setError(""); setNotice(""); }} aria-label="Fermer">×</button></div>}
+
+          {showNameDialog && <div className="modal-backdrop profile-backdrop">
+            <form className="modal-card profile-modal" onSubmit={(event) => void saveUserName(event)}>
+              <div className="modal-kicker">LUCY // ENTRE NOUS</div>
+              {currentUserName && <button type="button" className="modal-close" onClick={() => setShowNameDialog(false)}>×</button>}
+              <h2>Comment tu t’appelles ?</h2>
+              <p>Je garde ton prénom uniquement sur cet ordinateur. Comme ça, je peux te parler plus naturellement.</p>
+              <label className="field-label" htmlFor="user-name">TON PRÉNOM OU SURNOM</label>
+              <input id="user-name" autoFocus autoComplete="given-name" value={userNameInput} onChange={(event) => setUserNameInput(event.target.value)} placeholder="Prénom ou surnom" maxLength={60} required />
+              <button className="approve-button provider-save" disabled={savingUserName || !userNameInput.trim()}>{savingUserName ? "ENREGISTREMENT…" : "C’EST NOTÉ ↗"}</button>
+              <span className="modal-foot">STOCKAGE LOCAL · MODIFIABLE À TOUT MOMENT</span>
+            </form>
+          </div>}
 
           {!ready ? (
             <div className="empty-chat"><span className="empty-symbol">◌</span><p>INITIALISATION DU SYSTÈME LOCAL…</p></div>
@@ -1125,7 +1175,7 @@ function App() {
                         <pre>{segment.tool.name === "run_shell" ? String(segment.tool.arguments.command ?? "") : JSON.stringify(segment.tool.arguments, null, 2)}</pre>
                         {segment.tool.result?.trim() && <pre className="tool-result">{segment.tool.result}</pre>}
                       </details>)}
-                  {message.role !== "user" && busy && message.id === draftAnswer?.id && message.segments.length === 0 && <div className="thinking"><span className="pulse" /> LUCY RÉPOND…</div>}
+                  {message.role !== "user" && busy && message.id === draftAnswer?.id && message.segments.length === 0 && <div className="thinking"><span className="pulse" /> {contextCompacting ? "LUCY CONDENSE LE CONTEXTE…" : "LUCY RÉPOND…"}</div>}
                 </article>)}
               </div>
               <div className="composer-wrap">

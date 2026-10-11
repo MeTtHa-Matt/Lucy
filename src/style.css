@@ -1674,6 +1674,14 @@ details.tool-card summary {
   box-shadow: 0 18px 90px #000;
 }
 
+.profile-backdrop {
+  z-index: 30;
+}
+
+.profile-modal {
+  width: min(440px, calc(100vw - 60px));
+}
+
 .provider-card {
   display: flex;
   align-items: center;
