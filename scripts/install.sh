@@ -203,7 +203,14 @@ CARGO_TARGET_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/lucy/installer-cargo-target"
 export CARGO_TARGET_DIR
 mkdir -p "$CARGO_TARGET_DIR" || fail "Impossible de créer le cache de compilation Rust : $CARGO_TARGET_DIR"
 
-step "02  /  PROJET" "npm · Rust · Tauri" "Installation des paquets du projet et compilation"
+INSTALL_MODE="INSTALLATION"
+if [[ "$(uname -s)" == "Darwin" ]]; then
+  [[ -d "$HOME/Applications/LUCY Neural Interface.app" ]] && INSTALL_MODE="MISE À JOUR"
+else
+  [[ -x "$HOME/.local/bin/lucy" ]] && INSTALL_MODE="MISE À JOUR"
+fi
+
+step "02  /  $INSTALL_MODE" "npm · Rust · Tauri" "Compilation puis installation de LUCY"
 cd "$ROOT"
 npm ci || fail "L’installation des paquets npm a échoué."
 
@@ -211,7 +218,23 @@ if [[ "$(uname -s)" == "Darwin" ]]; then
   npm run tauri -- build --bundles app || fail "La compilation macOS a échoué."
   APP_PATH="$CARGO_TARGET_DIR/release/bundle/macos/LUCY Neural Interface.app"
   mkdir -p "$HOME/Applications"
-  cp -R "$APP_PATH" "$HOME/Applications/" || fail "Impossible d’installer l’application dans ~/Applications."
+  TARGET_APP="$HOME/Applications/LUCY Neural Interface.app"
+  STAGING_DIR="$(mktemp -d "$HOME/Applications/.lucy-update.XXXXXX")" \
+    || fail "Impossible de préparer la mise à jour de LUCY."
+  cp -R "$APP_PATH" "$STAGING_DIR/LUCY Neural Interface.app" \
+    || fail "Impossible de préparer la nouvelle application."
+  if [[ -d "$TARGET_APP" ]]; then
+    mv "$TARGET_APP" "$STAGING_DIR/previous.app" \
+      || fail "Impossible de déplacer l’ancienne application pour la mise à jour."
+  fi
+  if ! mv "$STAGING_DIR/LUCY Neural Interface.app" "$TARGET_APP"; then
+    if [[ -d "$STAGING_DIR/previous.app" ]]; then
+      mv "$STAGING_DIR/previous.app" "$TARGET_APP" \
+        || fail "La mise à jour a échoué et l’ancienne application n’a pas pu être restaurée."
+    fi
+    fail "Impossible d’installer la nouvelle application macOS."
+  fi
+  rm -rf -- "$STAGING_DIR"
   INSTALL_PATH="$HOME/Applications/LUCY Neural Interface.app"
 else
   npm run tauri -- build --no-bundle || fail "La compilation Linux a échoué."

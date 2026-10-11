@@ -14,6 +14,8 @@ Sous Windows, lance `scripts/install.bat` depuis l’Explorateur ou PowerShell. 
 
 Après la compilation, l’installateur demande le prénom ou surnom à utiliser dans les conversations. Il est conservé localement et peut ensuite être modifié dans l’application. Si le projet est déjà compilé manuellement, les prérequis et commandes d’installation ci-dessous restent disponibles.
 
+Relancer l’installateur depuis le projet recompilé met à jour LUCY à son emplacement existant et rafraîchit son lanceur ; les sessions, fournisseurs et préférences locales sont conservés. Sous Windows, l’application doit être fermée pour remplacer l’exécutable.
+
 Installe les dépendances de compilation et bibliothèques graphiques :
 
 ```sh

@@ -103,8 +103,11 @@ if (-not (Test-Path $VsDevCmd)) { throw "VsDevCmd.bat introuvable dans l’insta
 $CargoTargetDir = Join-Path $env:LOCALAPPDATA "Lucy\installer-cargo-target"
 New-Item -ItemType Directory -Path $CargoTargetDir -Force | Out-Null
 $env:CARGO_TARGET_DIR = $CargoTargetDir
+$InstallDir = Join-Path $env:LOCALAPPDATA "Programs\Lucy"
+$InstallExe = Join-Path $InstallDir "lucy.exe"
+$InstallMode = if (Test-Path $InstallExe) { "MISE À JOUR" } else { "INSTALLATION" }
 
-Show-Frame "03  /  COMPILATION" "Installation npm et compilation native Windows"
+Show-Frame "03  /  $InstallMode" "Compilation de LUCY pour Windows"
 Push-Location $Root
 try {
     $BuildCommand = "call `"$VsDevCmd`" -arch=x64 && cd /d `"$Root`" && npm ci && npm run tauri -- build --no-bundle"
@@ -116,9 +119,21 @@ try {
 
 $Exe = Join-Path $CargoTargetDir "release\lucy.exe"
 if (-not (Test-Path $Exe)) { throw "La compilation est terminée mais lucy.exe est introuvable." }
-$InstallDir = Join-Path $env:LOCALAPPDATA "Programs\Lucy"
+if (Test-Path $InstallExe) {
+    $RunningLucy = Get-Process -Name "lucy" -ErrorAction SilentlyContinue | Where-Object {
+        try { $_.Path -eq $InstallExe } catch { $false }
+    }
+    if ($RunningLucy) {
+        Show-Frame "04  /  FERMER LUCY" "LUCY doit être fermée pour appliquer la mise à jour"
+        Read-Host "  Ferme LUCY, puis appuie sur Entrée"
+        $StillRunning = Get-Process -Name "lucy" -ErrorAction SilentlyContinue | Where-Object {
+            try { $_.Path -eq $InstallExe } catch { $false }
+        }
+        if ($StillRunning) { throw "LUCY est encore ouverte. Ferme-la puis relance l’installateur." }
+    }
+}
 New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
-Copy-Item $Exe (Join-Path $InstallDir "lucy.exe") -Force
+Copy-Item $Exe $InstallExe -Force
 
 $DataDir = Join-Path $env:APPDATA "com.lucy.neural"
 $StorePath = Join-Path $DataDir "lucy.json"
@@ -149,7 +164,7 @@ if (-not $SavedName) {
     $UserName = [string]$SavedName
 }
 
-Show-Frame "05  /  TERMINÉ" "LUCY · installation prête"
+Show-Frame "05  /  TERMINÉ" "LUCY · $InstallMode terminée"
 Write-Host "  Exécutable : $InstallDir\lucy.exe" -ForegroundColor $Green
 Write-Host "  Salut $UserName — ton prénom est enregistré localement." -ForegroundColor $Dim
 Write-Host ""
