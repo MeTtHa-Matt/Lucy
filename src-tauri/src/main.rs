@@ -834,6 +834,7 @@ fn public_state(store: &LocalStore) -> PublicState {
 fn provider_base_url(id: &str) -> Option<&'static str> {
     match id {
         "github-copilot" => Some("https://api.githubcopilot.com"),
+        "opencode" => Some("https://opencode.ai/zen/v1"),
         "google" | "google-vertex" | "google-vertex-anthropic" => {
             Some("https://generativelanguage.googleapis.com/v1beta/openai")
         }
@@ -871,6 +872,7 @@ fn imported_provider(input: &serde_json::Value) -> Option<StoredProvider> {
     let base_url = provider_base_url(id)?;
     let name = match id {
         "github-copilot" => "GitHub Copilot".to_string(),
+        "opencode" => "OpenCode Zen".to_string(),
         "google" | "google-vertex" | "google-vertex-anthropic" => "Google AI".to_string(),
         "groq" => "Groq".to_string(),
         _ => id.to_string(),
@@ -3677,6 +3679,23 @@ mod tests {
             assert!(provider.models.is_empty());
             assert_eq!(provider.models_error, None);
         }
+    }
+
+    #[test]
+    fn imports_opencode_zen_api_key_and_catalog_url() {
+        let exported = serde_json::json!({
+            "integrationID": "opencode",
+            "value": {
+                "type": "key",
+                "key": "test-zen-secret"
+            }
+        });
+
+        let provider = imported_provider(&exported).unwrap();
+        assert_eq!(provider.id, "opencode");
+        assert_eq!(provider.name, "OpenCode Zen");
+        assert_eq!(provider.base_url, "https://opencode.ai/zen/v1");
+        assert_eq!(provider.api_key, "test-zen-secret");
     }
 
     #[test]

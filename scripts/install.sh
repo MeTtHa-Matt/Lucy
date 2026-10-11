@@ -43,6 +43,68 @@ fail() {
 
 has_command() { command -v "$1" >/dev/null 2>&1; }
 
+configure_linux_command_path() {
+  local shell_name="${SHELL##*/}" config line
+  local -a configs=()
+
+  case "$shell_name" in
+    bash)
+      configs=("$HOME/.profile" "$HOME/.bashrc")
+      line='case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) export PATH="$HOME/.local/bin:$PATH" ;; esac'
+      ;;
+    zsh)
+      configs=("$HOME/.zprofile" "$HOME/.zshrc")
+      line='case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) export PATH="$HOME/.local/bin:$PATH" ;; esac'
+      ;;
+    fish)
+      configs=("${XDG_CONFIG_HOME:-$HOME/.config}/fish/config.fish")
+      line='fish_add_path --path "$HOME/.local/bin"'
+      ;;
+    *)
+      configs=("$HOME/.profile")
+      line='case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) export PATH="$HOME/.local/bin:$PATH" ;; esac'
+      ;;
+  esac
+
+  for config in "${configs[@]}"; do
+    if [[ -f "$config" ]] && grep -Fqx -- "$line" "$config"; then
+      continue
+    fi
+    mkdir -p "$(dirname "$config")" || fail "Impossible de préparer la configuration du shell : $config"
+    printf '\n%s\n' "$line" >> "$config" || fail "Impossible d’ajouter ~/.local/bin au PATH dans $config."
+  done
+}
+
+install_linux_desktop_entry() {
+  local desktop_dir="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
+  local desktop_entry="$desktop_dir/lucy.desktop"
+  local desktop_exec="$HOME/.local/bin/lucy"
+  local line found_desktop_exec=0
+
+  mkdir -p "$desktop_dir" || fail "Impossible de préparer le menu des applications."
+  desktop_exec="${desktop_exec//\\/\\\\}"
+  desktop_exec="${desktop_exec//\"/\\\"}"
+  desktop_exec="${desktop_exec//%/%%}"
+  {
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      if [[ "$line" == "Exec=lucy" ]]; then
+        printf 'Exec="%s"\n' "$desktop_exec"
+        found_desktop_exec=1
+      else
+        printf '%s\n' "$line"
+      fi
+    done < "$ROOT/lucy.desktop"
+  } > "$desktop_entry" || fail "Impossible de créer le raccourci LUCY dans le menu des applications."
+  ((found_desktop_exec)) || fail "Le raccourci LUCY ne contient pas de commande Exec=lucy."
+  chmod 644 "$desktop_entry" || fail "Impossible de définir les permissions du raccourci LUCY."
+  if has_command update-desktop-database; then
+    if ! update-desktop-database "$desktop_dir"; then
+      paint '33' "  Avertissement : le cache du menu des applications n’a pas pu être actualisé."
+      printf '\n'
+    fi
+  fi
+}
+
 package_installed() {
   case "$1" in
     pacman) pacman -Q "$2" >/dev/null 2>&1 ;;
@@ -239,9 +301,8 @@ if [[ "$(uname -s)" == "Darwin" ]]; then
 else
   npm run tauri -- build --no-bundle || fail "La compilation Linux a échoué."
   install -Dm755 "$CARGO_TARGET_DIR/release/lucy" "$HOME/.local/bin/lucy" || fail "Impossible d’installer LUCY dans ~/.local/bin."
-  install -Dm644 "$ROOT/lucy.desktop" \
-    "${XDG_DATA_HOME:-$HOME/.local/share}/applications/lucy.desktop" \
-    || fail "Impossible de créer le raccourci LUCY dans le menu des applications."
+  configure_linux_command_path
+  install_linux_desktop_entry
   install -Dm644 "$ROOT/src-tauri/icons/icon.png" \
     "${XDG_DATA_HOME:-$HOME/.local/share}/icons/hicolor/256x256/apps/lucy.png" \
     || fail "Impossible d’installer l’icône du raccourci LUCY."

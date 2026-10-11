@@ -6,5 +6,5 @@ Comment=Assistant IA autonome pour le développement
 Exec=lucy
 Icon=lucy
 Terminal=false
-Categories=Development;Utility;
+Categories=Development;
 StartupWMClass=lucy

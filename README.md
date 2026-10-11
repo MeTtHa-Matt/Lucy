@@ -2,7 +2,7 @@
 
 Application de bureau autonome pour Arch Linux et Hyprland. Le chat et les réponses en flux SSE sont envoyés directement à un fournisseur compatible OpenAI ; le serveur OpenCode n’est pas nécessaire pour discuter.
 
-## Installation sur Arch Linux
+## Installation
 
 L’installateur interactif vérifie les dépendances et propose leur installation avant de compiler LUCY. Sous Linux ou macOS, lance :
 
@@ -40,7 +40,7 @@ install -Dm644 src-tauri/icons/icon.png "$HOME/.local/share/icons/hicolor/256x25
 lucy
 ```
 
-Au premier lancement, LUCY importe automatiquement les comptes OpenCode déjà présents lorsque son stockage local ne contient encore aucun fournisseur. Les comptes OpenCode déjà importés sont resynchronisés en arrière-plan aux lancements suivants, afin d’ajouter les nouvelles connexions. Les clés API OpenCode de type `key` (par exemple Google et Groq) ainsi que les connexions OAuth prises en charge sont importées. En cas d’échec de catalogue, le compte reste enregistré et l’interface affiche l’erreur avec une action pour réessayer. Le modèle actuellement sélectionné est conservé localement et restauré au prochain lancement. Si `~/.local/bin` n'est pas déjà dans ton `PATH`, ajoute-le à la configuration de ton shell.
+Au premier lancement, LUCY importe automatiquement les comptes OpenCode déjà présents lorsque son stockage local ne contient encore aucun fournisseur. Les comptes OpenCode déjà importés sont resynchronisés en arrière-plan aux lancements suivants, afin d’ajouter les nouvelles connexions. Les clés API OpenCode Zen, Google et Groq, ainsi que les connexions OAuth prises en charge, sont importées. En cas d’échec de catalogue, le compte reste enregistré et l’interface affiche l’erreur avec une action pour réessayer. Le modèle actuellement sélectionné est conservé localement et restauré au prochain lancement. Sous Linux, l’installateur ajoute `~/.local/bin` au `PATH` des nouveaux terminaux et le raccourci du menu lance directement le binaire installé.
 
 ## Fournisseurs et modèles
 
