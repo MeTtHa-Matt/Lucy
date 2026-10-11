@@ -86,7 +86,11 @@ if ($Missing.Count -gt 0) {
     Show-Frame "02  /  DÉPENDANCES" "Node.js · Rust · MSVC · WebView2 déjà installés"
 }
 
-$env:Path = "$env:Path;$env:USERPROFILE\.cargo\bin;$env:ProgramFiles\nodejs"
+$env:Path = @(
+    $env:Path
+    (Join-Path $env:USERPROFILE ".cargo\bin")
+    (Join-Path $env:ProgramFiles "nodejs")
+) -join [System.IO.Path]::PathSeparator
 if (-not (Get-Command npm -ErrorAction SilentlyContinue)) {
     throw "npm est toujours introuvable après l’installation. Ferme et rouvre PowerShell, puis relance scripts/install.ps1."
 }
@@ -110,7 +114,7 @@ $InstallMode = if (Test-Path $InstallExe) { "MISE À JOUR" } else { "INSTALLATIO
 Show-Frame "03  /  $InstallMode" "Compilation de LUCY pour Windows"
 Push-Location $Root
 try {
-    $BuildCommand = "call `"$VsDevCmd`" -arch=x64 && cd /d `"$Root`" && npm ci && npm run tauri -- build --no-bundle"
+    $BuildCommand = 'call "{0}" -arch=x64 && cd /d "{1}" && npm ci && npm run tauri -- build --no-bundle' -f $VsDevCmd, $Root
     & cmd.exe /d /s /c $BuildCommand
     if ($LASTEXITCODE -ne 0) { throw "La compilation de LUCY a échoué (code $LASTEXITCODE)." }
 } finally {
