@@ -100,6 +100,10 @@ if (-not $VsInstall) {
 $VsDevCmd = Join-Path $VsInstall "Common7\Tools\VsDevCmd.bat"
 if (-not (Test-Path $VsDevCmd)) { throw "VsDevCmd.bat introuvable dans l’installation Visual Studio." }
 
+$CargoTargetDir = Join-Path $env:LOCALAPPDATA "Lucy\installer-cargo-target"
+New-Item -ItemType Directory -Path $CargoTargetDir -Force | Out-Null
+$env:CARGO_TARGET_DIR = $CargoTargetDir
+
 Show-Frame "03  /  COMPILATION" "Installation npm et compilation native Windows"
 Push-Location $Root
 try {
@@ -110,7 +114,7 @@ try {
     Pop-Location
 }
 
-$Exe = Join-Path $Root "src-tauri\target\release\lucy.exe"
+$Exe = Join-Path $CargoTargetDir "release\lucy.exe"
 if (-not (Test-Path $Exe)) { throw "La compilation est terminée mais lucy.exe est introuvable." }
 $InstallDir = Join-Path $env:LOCALAPPDATA "Programs\Lucy"
 New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null

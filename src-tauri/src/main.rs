@@ -86,9 +86,19 @@ struct ChatSession {
     context_summary: Option<String>,
     #[serde(default)]
     context_summary_message_count: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    context_usage: Option<ContextUsage>,
     messages: Vec<ChatMessage>,
     created_at: u64,
     updated_at: u64,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ContextUsage {
+    model_id: String,
+    used_tokens: usize,
+    limit_tokens: usize,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -521,6 +531,39 @@ fn request_token_estimate(messages: &[Value], tools: &Value) -> usize {
     let messages_size = serde_json::to_string(messages).map_or(0, |value| value.len());
     let tools_size = serde_json::to_string(tools).map_or(0, |value| value.len());
     messages_size.saturating_add(tools_size).div_ceil(4)
+}
+
+fn model_context_limit(model_id: &str) -> usize {
+    let model = model_id.to_ascii_lowercase();
+    if model.contains("claude") {
+        200_000
+    } else if model.contains("gemini") {
+        1_000_000
+    } else if model.contains("gpt-4.1") || model.contains("gpt-4.5") {
+        1_000_000
+    } else if model.contains("gpt-4o")
+        || model.contains("gpt-4-turbo")
+        || model.contains("o1")
+        || model.contains("o3")
+        || model.contains("o4")
+    {
+        128_000
+    } else if model.contains("deepseek") {
+        64_000
+    } else {
+        32_000
+    }
+}
+
+fn context_usage_percent(usage: &ContextUsage) -> usize {
+    if usage.limit_tokens == 0 {
+        return 0;
+    }
+    usage
+        .used_tokens
+        .saturating_mul(100)
+        .div_ceil(usage.limit_tokens)
+        .min(100)
 }
 
 fn compaction_boundary(history: &[ChatMessage], keep_recent_tokens: usize) -> Option<usize> {
@@ -1884,6 +1927,48 @@ fn append_session_message(
     save_store(state, &store)
 }
 
+fn record_context_usage(
+    app: &AppHandle,
+    state: &AppState,
+    session_id: &str,
+    model_id: &str,
+    used_tokens: usize,
+) -> Result<(), String> {
+    let usage = ContextUsage {
+        model_id: model_id.to_string(),
+        used_tokens,
+        limit_tokens: model_context_limit(model_id),
+    };
+    let mut store = state
+        .store
+        .lock()
+        .map_err(|_| "Impossible d’accéder aux données LUCY.".to_string())?;
+    let session = store
+        .sessions
+        .iter_mut()
+        .find(|session| session.id == session_id)
+        .ok_or_else(|| "La session a été supprimée pendant la génération.".to_string())?;
+    session.context_usage = Some(usage.clone());
+    save_store(state, &store)?;
+    let _ = app.emit(
+        CHAT_UPDATE,
+        ChatUpdate {
+            session_id: session_id.to_string(),
+            message_id: "context-usage".into(),
+            kind: "context_usage".into(),
+            delta: String::new(),
+            error: None,
+            details: Some(serde_json::json!({
+                "modelId": usage.model_id,
+                "usedTokens": usage.used_tokens,
+                "limitTokens": usage.limit_tokens,
+                "percent": context_usage_percent(&usage),
+            })),
+        },
+    );
+    Ok(())
+}
+
 fn emit_chat_error(app: &AppHandle, session_id: &str, message_id: &str, error: &str) {
     let _ = app.emit(
         CHAT_UPDATE,
@@ -2340,6 +2425,7 @@ fn create_chat_session(
         allow_all_tools: false,
         context_summary: None,
         context_summary_message_count: 0,
+        context_usage: None,
         messages: Vec::new(),
         created_at: now,
         updated_at: now,
@@ -2427,6 +2513,9 @@ async fn send_message(
             .find(|session| session.id == session_id)
             .ok_or_else(|| "La session n'existe plus.".to_string())?;
         session.provider_id = provider_id;
+        if session.model_id != model_id {
+            session.context_usage = None;
+        }
         session.model_id = model_id.clone();
         session.mode = mode.clone();
         let user_message = ChatMessage {
@@ -2567,6 +2656,17 @@ async fn send_message(
             payload["tools"] = tools_for_mode(&session.mode);
             payload["tool_choice"] = Value::String("auto".into());
         }
+        let request_tools = payload.get("tools").unwrap_or(&Value::Null);
+        let request_messages = payload["messages"]
+            .as_array()
+            .ok_or_else(|| "Le contexte du modèle n’est pas une liste de messages.".to_string())?;
+        record_context_usage(
+            &app,
+            &state,
+            &session_id,
+            &request_model_id,
+            request_token_estimate(request_messages, request_tools),
+        )?;
         let mut retry_attempt = 0;
         let mut compacted_after_rejection = false;
         let response = loop {
@@ -2648,6 +2748,19 @@ async fn send_message(
                                 session.context_summary.as_deref(),
                                 &chat_history,
                             ));
+                            let request_tools = payload.get("tools").unwrap_or(&Value::Null);
+                            let request_messages =
+                                payload["messages"].as_array().ok_or_else(|| {
+                                    "Le contexte du modèle n’est pas une liste de messages."
+                                        .to_string()
+                                })?;
+                            record_context_usage(
+                                &app,
+                                &state,
+                                &session_id,
+                                &request_model_id,
+                                request_token_estimate(request_messages, request_tools),
+                            )?;
                             continue;
                         }
                     }
@@ -3092,6 +3205,7 @@ fn truncate_session_from_message(
     session.messages.truncate(index);
     session.context_summary = None;
     session.context_summary_message_count = 0;
+    session.context_usage = None;
     session.title = session
         .messages
         .iter()
@@ -3325,6 +3439,11 @@ mod tests {
             allow_all_tools: false,
             context_summary: Some("Earlier work was completed.".into()),
             context_summary_message_count: boundary,
+            context_usage: Some(ContextUsage {
+                model_id: "test".into(),
+                used_tokens: 1_200,
+                limit_tokens: 32_000,
+            }),
             messages: history,
             created_at: now_millis(),
             updated_at: now_millis(),
@@ -3336,6 +3455,7 @@ mod tests {
             Some("Earlier work was completed.")
         );
         assert_eq!(restored.context_summary_message_count, boundary);
+        assert_eq!(restored.context_usage.unwrap().used_tokens, 1_200);
     }
 
     #[test]
@@ -3352,6 +3472,30 @@ mod tests {
             reqwest::StatusCode::BAD_REQUEST,
             "invalid API key"
         ));
+    }
+
+    #[test]
+    fn estimates_known_model_context_limits_and_usage_percentages() {
+        assert_eq!(model_context_limit("claude-sonnet-4"), 200_000);
+        assert_eq!(model_context_limit("gemini-2.5-pro"), 1_000_000);
+        assert_eq!(model_context_limit("gpt-4o-mini"), 128_000);
+        assert_eq!(model_context_limit("local-custom-model"), 32_000);
+        assert_eq!(
+            context_usage_percent(&ContextUsage {
+                model_id: "test".into(),
+                used_tokens: 25,
+                limit_tokens: 100,
+            }),
+            25
+        );
+        assert_eq!(
+            context_usage_percent(&ContextUsage {
+                model_id: "test".into(),
+                used_tokens: 120,
+                limit_tokens: 100,
+            }),
+            100
+        );
     }
 
     #[test]

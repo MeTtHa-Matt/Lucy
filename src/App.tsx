@@ -44,6 +44,11 @@ type ToolApproval = {
   toolName: string;
   arguments: Record<string, unknown>;
 };
+type ContextUsage = {
+  modelId: string;
+  usedTokens: number;
+  limitTokens: number;
+};
 type Session = {
   id: string;
   title: string;
@@ -52,6 +57,7 @@ type Session = {
   modelId: string;
   mode: "build" | "plan" | "discussion";
   allowAllTools: boolean;
+  contextUsage?: ContextUsage | null;
   messages: ChatMessage[];
   createdAt: number;
   updatedAt: number;
@@ -67,7 +73,7 @@ type AppState = {
 type ChatUpdate = {
   sessionId: string;
   messageId: string;
-  kind: "user" | "delta" | "round" | "done" | "stopped" | "error" | "retry" | "context" | "compacting" | "compacted" | "tool_start" | "tool_result";
+  kind: "user" | "delta" | "round" | "done" | "stopped" | "error" | "retry" | "context" | "context_usage" | "compacting" | "compacted" | "tool_start" | "tool_result";
   delta: string;
   error?: string;
   details?: Record<string, unknown>;
@@ -134,6 +140,7 @@ function App() {
   const [projectContext, setProjectContext] = useState<ProjectContext | null>(null);
   const [contextLoading, setContextLoading] = useState(false);
   const [contextCompacting, setContextCompacting] = useState(false);
+  const [contextMeterOpen, setContextMeterOpen] = useState(false);
   const chatScroll = useRef<HTMLDivElement>(null);
   const messageMenuRef = useRef<HTMLDivElement>(null);
   const stickToChatBottom = useRef(true);
@@ -144,6 +151,10 @@ function App() {
   const windowControls = isTauri() ? getCurrentWindow() : null;
   const projectPath = appState.projectPath ?? "";
   const currentSession = appState.sessions.find((session) => session.id === sessionId);
+  const contextUsage = currentSession?.contextUsage?.modelId === modelId ? currentSession.contextUsage : null;
+  const contextPercent = contextUsage && contextUsage.limitTokens > 0
+    ? Math.min(100, Math.round(contextUsage.usedTokens * 100 / contextUsage.limitTokens))
+    : 0;
   const currentProvider = appState.providers.find((provider) => provider.id === providerId);
   const currentUserName = appState.userName?.trim() ?? "";
   const visibleSessions = useMemo(
@@ -360,6 +371,18 @@ function App() {
       } else if (update.kind === "context") {
         setProjectContext(update.details as unknown as ProjectContext);
         setContextLoading(false);
+      } else if (update.kind === "context_usage") {
+        const usage = {
+          modelId: String(update.details?.modelId ?? ""),
+          usedTokens: Number(update.details?.usedTokens ?? 0),
+          limitTokens: Number(update.details?.limitTokens ?? 0),
+        };
+        setAppState((previous) => ({
+          ...previous,
+          sessions: previous.sessions.map((session) =>
+            session.id === update.sessionId ? { ...session, contextUsage: usage } : session,
+          ),
+        }));
       } else if (update.kind === "compacting") {
         setContextCompacting(true);
       } else if (update.kind === "compacted") {
@@ -1197,6 +1220,27 @@ function App() {
                       <option value="discussion">DISCUSSION</option>
                     </select>
                     <span className="composer-hint">SHIFT + ENTER POUR UNE NOUVELLE LIGNE</span>
+                    {contextUsage && <div className="context-meter-wrap">
+                      <button
+                        className={`context-meter ${contextPercent >= 85 ? "context-meter-high" : ""}`}
+                        type="button"
+                        aria-label={`Utilisation estimée du contexte : ${contextPercent} %`}
+                        aria-expanded={contextMeterOpen}
+                        title="Afficher l’utilisation estimée du contexte"
+                        onClick={() => setContextMeterOpen((open) => !open)}
+                      >
+                        <svg viewBox="0 0 36 36" aria-hidden="true">
+                          <circle className="context-meter-track" cx="18" cy="18" r="15.5" pathLength="100" />
+                          <circle className="context-meter-fill" cx="18" cy="18" r="15.5" pathLength="100" style={{ strokeDasharray: `${contextPercent} 100` }} />
+                        </svg>
+                        <span>{contextPercent}</span>
+                      </button>
+                      {contextMeterOpen && <div className="context-meter-popover" role="status">
+                        <strong>{contextPercent}% DU CONTEXTE</strong>
+                        <span>~{contextUsage.usedTokens.toLocaleString("fr-FR")} / {contextUsage.limitTokens.toLocaleString("fr-FR")} tokens</span>
+                        <small>Estimation du contexte envoyé. La limite réelle et le décompte peuvent varier selon le fournisseur.</small>
+                      </div>}
+                    </div>}
                     {busy
                       ? <button className="send-button stop-button" onClick={() => void stopGeneration()} aria-label="Arrêter la réponse" title="Arrêter la réponse"><span className="stop-square" /></button>
                       : <button className="send-button" onClick={() => void sendMessage()} disabled={!input.trim()}>ENVOYER ↗</button>}

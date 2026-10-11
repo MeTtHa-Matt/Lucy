@@ -58,7 +58,9 @@ missing_packages() {
   for package in "$@"; do
     package_installed "$manager" "$package" || missing+=("$package")
   done
-  printf '%s\n' "${missing[@]}"
+  if ((${#missing[@]})); then
+    printf '%s\n' "${missing[@]}"
+  fi
 }
 
 install_linux_dependencies() {
@@ -197,19 +199,29 @@ if ! has_command node || ! has_command npm || ! has_command cargo; then
   fail "Dépendance manquante après installation : node, npm et cargo doivent être accessibles dans PATH."
 fi
 
+CARGO_TARGET_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/lucy/installer-cargo-target"
+export CARGO_TARGET_DIR
+mkdir -p "$CARGO_TARGET_DIR" || fail "Impossible de créer le cache de compilation Rust : $CARGO_TARGET_DIR"
+
 step "02  /  PROJET" "npm · Rust · Tauri" "Installation des paquets du projet et compilation"
 cd "$ROOT"
 npm ci || fail "L’installation des paquets npm a échoué."
 
 if [[ "$(uname -s)" == "Darwin" ]]; then
   npm run tauri -- build --bundles app || fail "La compilation macOS a échoué."
-  APP_PATH="$ROOT/src-tauri/target/release/bundle/macos/LUCY Neural Interface.app"
+  APP_PATH="$CARGO_TARGET_DIR/release/bundle/macos/LUCY Neural Interface.app"
   mkdir -p "$HOME/Applications"
   cp -R "$APP_PATH" "$HOME/Applications/" || fail "Impossible d’installer l’application dans ~/Applications."
   INSTALL_PATH="$HOME/Applications/LUCY Neural Interface.app"
 else
   npm run tauri -- build --no-bundle || fail "La compilation Linux a échoué."
-  install -Dm755 "$ROOT/src-tauri/target/release/lucy" "$HOME/.local/bin/lucy" || fail "Impossible d’installer LUCY dans ~/.local/bin."
+  install -Dm755 "$CARGO_TARGET_DIR/release/lucy" "$HOME/.local/bin/lucy" || fail "Impossible d’installer LUCY dans ~/.local/bin."
+  install -Dm644 "$ROOT/lucy.desktop" \
+    "${XDG_DATA_HOME:-$HOME/.local/share}/applications/lucy.desktop" \
+    || fail "Impossible de créer le raccourci LUCY dans le menu des applications."
+  install -Dm644 "$ROOT/src-tauri/icons/icon.png" \
+    "${XDG_DATA_HOME:-$HOME/.local/share}/icons/hicolor/256x256/apps/lucy.png" \
+    || fail "Impossible d’installer l’icône du raccourci LUCY."
   INSTALL_PATH="$HOME/.local/bin/lucy"
 fi
 

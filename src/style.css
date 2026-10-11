@@ -1411,6 +1411,98 @@ details.tool-card summary {
   font-size: 7px;
 }
 
+.context-meter-wrap {
+  position: relative;
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+}
+
+.context-meter {
+  position: relative;
+  display: grid;
+  width: 31px;
+  height: 31px;
+  flex: 0 0 31px;
+  place-items: center;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: #ed7185;
+  cursor: pointer;
+}
+
+.context-meter svg {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  transform: rotate(-90deg);
+}
+
+.context-meter circle {
+  fill: none;
+  stroke-width: 3;
+}
+
+.context-meter-track {
+  stroke: #35262d;
+}
+
+.context-meter-fill {
+  stroke: currentColor;
+  stroke-linecap: round;
+  transition: stroke-dasharray 0.3s ease, color 0.2s ease;
+}
+
+.context-meter > span {
+  font-family: var(--mono);
+  font-size: 8px;
+  font-variant-numeric: tabular-nums;
+}
+
+.context-meter:hover,
+.context-meter[aria-expanded="true"] {
+  color: #ff9bab;
+}
+
+.context-meter-high {
+  color: #ff536e;
+}
+
+.context-meter-popover {
+  position: absolute;
+  z-index: 20;
+  right: 0;
+  bottom: calc(100% + 10px);
+  display: flex;
+  width: 230px;
+  flex-direction: column;
+  gap: 7px;
+  padding: 12px;
+  border: 1px solid #57313b;
+  background: #100d11;
+  box-shadow: 0 8px 24px #0009;
+  color: #d9cbd1;
+  font-family: var(--mono);
+}
+
+.context-meter-popover strong {
+  color: #ff8295;
+  font-size: 9px;
+  letter-spacing: 0.08em;
+}
+
+.context-meter-popover span {
+  font-size: 10px;
+}
+
+.context-meter-popover small {
+  color: #92848b;
+  font-size: 8px;
+  line-height: 1.6;
+}
+
 .send-button {
   height: 29px;
   padding: 0 11px;

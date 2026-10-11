@@ -10,7 +10,7 @@ L’installateur interactif vérifie les dépendances et propose leur installati
 bash scripts/install.sh
 ```
 
-Sous Windows, lance `scripts/install.bat` depuis l’Explorateur ou PowerShell. L’installateur utilise `winget` après confirmation pour les outils manquants. Sur Linux, il détecte la distribution, le gestionnaire de paquets et l’environnement de bureau.
+Sous Windows, lance `scripts/install.bat` depuis l’Explorateur ou PowerShell. L’installateur utilise `winget` après confirmation pour les outils manquants. Sur Linux, il détecte la distribution, le gestionnaire de paquets et l’environnement de bureau, puis installe le binaire, le lanceur `lucy.desktop` dans le menu des applications et son icône. Les installateurs compilent dans un cache Cargo dédié au compte utilisateur, séparé de `src-tauri/target`, pour éviter les erreurs de cache après déplacement ou copie du projet.
 
 Après la compilation, l’installateur demande le prénom ou surnom à utiliser dans les conversations. Il est conservé localement et peut ensuite être modifié dans l’application. Si le projet est déjà compilé manuellement, les prérequis et commandes d’installation ci-dessous restent disponibles.
 
@@ -50,6 +50,7 @@ Les identifiants LUCY sont stockés dans son dossier de configuration local avec
 
 - Conversations locales, sélection de fournisseur/modèle et conservation de l’historique.
 - Condensation automatique du contexte de session : quand l’historique approche une limite estimée, LUCY demande au modèle connecté un résumé persistant et garde les échanges récents intacts. En cas de refus explicite pour dépassement de contexte, elle condense davantage puis réessaie automatiquement. L’historique complet reste visible et sauvegardé localement ; seul le contexte envoyé au modèle est résumé.
+- Indicateur circulaire d’utilisation du contexte près du bouton d’envoi : il affiche une estimation du contexte transmis par rapport à la fenêtre du modèle, et révèle le pourcentage et le nombre de tokens au clic. La taille de fenêtre est estimée à partir de l’identifiant du modèle et peut varier selon le fournisseur.
 - Au lancement, ouverture directe de `/home/Matthew` et création d’une nouvelle session. Le dossier de projet reste modifiable depuis la barre latérale.
 - Sélecteur de modèle et modes `Build`, `Plan` (lecture seule) et `Discussion` (sans outils) dans la barre de saisie.
 - Réponses diffusées en direct mot par mot, erreurs de fournisseur explicites et appels d’outils jusqu’à huit tours. Les erreurs temporaires HTTP 429/500/502/503/504 et les erreurs réseau déclenchent jusqu’à dix nouvelles tentatives avec compte à rebours visible, délai exponentiel (de 2 à 300 secondes) et prise en compte de l’en-tête `Retry-After` ; les erreurs permanentes ne sont pas répétées. Les métadonnées de fournisseur renvoyées avec les appels d’outils, dont les signatures de pensée Gemini, sont conservées et retransmises pour que les tours d’outils restent valides.
