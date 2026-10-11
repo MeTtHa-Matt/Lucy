@@ -68,7 +68,7 @@ type AppState = {
   sessions: Session[];
   selectedProviderId: string | null;
   selectedModelId: string | null;
-  userName: string | null;
+  isHyprlandSession: boolean;
 };
 type ChatUpdate = {
   sessionId: string;
@@ -98,7 +98,7 @@ const friendlyError = (error: unknown) => error instanceof Error ? error.message
 
 function App() {
   const [appState, setAppState] = useState<AppState>({
-    projectPath: null, providers: [], sessions: [], selectedProviderId: null, selectedModelId: null, userName: null,
+    projectPath: null, providers: [], sessions: [], selectedProviderId: null, selectedModelId: null, isHyprlandSession: false,
   });
   const [sessionId, setSessionId] = useState("");
   const [providerId, setProviderId] = useState("");
@@ -123,9 +123,6 @@ function App() {
   const [filePath, setFilePath] = useState("");
   const [fileContent, setFileContent] = useState("");
   const [showProvider, setShowProvider] = useState(false);
-  const [showNameDialog, setShowNameDialog] = useState(false);
-  const [userNameInput, setUserNameInput] = useState("");
-  const [savingUserName, setSavingUserName] = useState(false);
   const [showSkills, setShowSkills] = useState(false);
   const [skills, setSkills] = useState<ProjectSkill[]>([]);
   const [skillsBusy, setSkillsBusy] = useState(false);
@@ -156,7 +153,6 @@ function App() {
     ? Math.min(100, Math.round(contextUsage.usedTokens * 100 / contextUsage.limitTokens))
     : 0;
   const currentProvider = appState.providers.find((provider) => provider.id === providerId);
-  const currentUserName = appState.userName?.trim() ?? "";
   const visibleSessions = useMemo(
     () => appState.sessions.filter((session) => session.title.toLowerCase().includes(search.toLowerCase())),
     [appState.sessions, search],
@@ -177,11 +173,6 @@ function App() {
     setFilePath(path);
     setFileContent("");
   }, [projectPath]);
-
-  useEffect(() => {
-    if (ready && !currentUserName) setShowNameDialog(true);
-    if (currentUserName) setUserNameInput(currentUserName);
-  }, [currentUserName, ready]);
 
   const refreshExplorer = useCallback(async () => {
     if (!projectPath) return;
@@ -253,12 +244,12 @@ function App() {
     void (async () => {
       try {
         let state = await invoke<AppState>("load_app_state");
-        let importedAtStartup = false;
+        let attemptedOpenCodeImport = false;
         if (!active) return;
         if (state.providers.length === 0) {
+          attemptedOpenCodeImport = true;
           try {
             state = await invoke<AppState>("import_opencode_providers");
-            importedAtStartup = true;
           } catch (reason) {
             state = await invoke<AppState>("load_app_state");
             if (active && state.providers.length === 0) {
@@ -292,18 +283,22 @@ function App() {
           setMode("build");
           setAppState(await invoke<AppState>("load_app_state"));
         }
-        const hasImportedOpenCodeProvider = state.providers.some(
-          (provider) => provider.source === "oauth" || provider.source === "import",
-        );
         const initialCatalogError = state.providers.find((provider) => provider.modelsError);
         if (initialCatalogError) {
           setError(`${initialCatalogError.name} : ${initialCatalogError.modelsError}`);
         }
-        if (active && hasImportedOpenCodeProvider && !importedAtStartup) {
+        if (active && !attemptedOpenCodeImport) {
           void invoke<AppState>("import_opencode_providers")
-            .then((updated) => {
+            .then(async (updated) => {
               if (!active) return;
               setAppState(updated);
+              if (!updated.providers.some(
+                (provider) => provider.id === "opencode" || provider.id === "opencode-zen-free",
+              )) {
+                setError(
+                  "Le fournisseur OpenCode Zen n’a pas pu être ajouté. Vérifie que le CLI OpenCode est accessible depuis LUCY, puis relance l’import.",
+                );
+              }
               const selectedProvider = updated.providers.find(
                 (provider) => provider.id === updated.selectedProviderId,
               ) ?? updated.providers[0];
@@ -314,12 +309,34 @@ function App() {
               setModelId(selectedModel);
               const failedProvider = updated.providers.find((provider) => provider.modelsError);
               if (failedProvider) setError(`${failedProvider.name} : ${failedProvider.modelsError}`);
+              if (firstProvider && firstProvider.models.length === 0) {
+                const refreshedState = await invoke<AppState>("refresh_provider_models", {
+                  providerId: firstProvider.id,
+                });
+                if (!active) return;
+                setAppState(refreshedState);
+                const refreshed = refreshedState.providers.find((provider) => provider.id === firstProvider.id);
+                if (refreshed?.modelsError) {
+                  setError(`${refreshed.name} : ${refreshed.modelsError}`);
+                }
+                const nextModel = refreshed?.models.includes(refreshedState.selectedModelId ?? "")
+                  ? refreshedState.selectedModelId!
+                  : refreshed?.models[0] ?? "";
+                if (refreshed && nextModel) {
+                  setProviderId(refreshed.id);
+                  setModelId(nextModel);
+                  setAppState(await invoke<AppState>("set_selected_model", {
+                    providerId: refreshed.id,
+                    modelId: nextModel,
+                  }));
+                }
+              }
             })
             .catch((reason: unknown) => {
               if (active) setError(`Import automatique OpenCode impossible : ${friendlyError(reason)}`);
             });
         }
-        if (active && firstProvider && firstProvider.models.length === 0 && !hasImportedOpenCodeProvider) {
+        if (active && attemptedOpenCodeImport && firstProvider && firstProvider.models.length === 0) {
           void invoke<AppState>("refresh_provider_models", { providerId: firstProvider.id })
             .then(async (updated) => {
               if (!active) return;
@@ -456,6 +473,7 @@ function App() {
       } else if (update.kind === "done") {
         setContextCompacting(false);
         setRetryStatus(null);
+        void refreshExplorer().catch((reason: unknown) => setError(friendlyError(reason)));
         if (incompleteWord.current) {
           streamedEvents.current.push({
             kind: "word",
@@ -530,22 +548,6 @@ function App() {
       setError("");
     } catch (reason) {
       setError(friendlyError(reason));
-    }
-  };
-
-  const saveUserName = async (event: React.FormEvent) => {
-    event.preventDefault();
-    setSavingUserName(true);
-    try {
-      const updated = await invoke<AppState>("set_user_name", { userName: userNameInput });
-      setAppState(updated);
-      setShowNameDialog(false);
-      setNotice(`C’est noté, ${updated.userName}.`);
-      setError("");
-    } catch (reason) {
-      setError(friendlyError(reason));
-    } finally {
-      setSavingUserName(false);
     }
   };
 
@@ -723,6 +725,9 @@ function App() {
     try {
       const updated = await invoke<AppState>("import_opencode_providers");
       setAppState(updated);
+      const hasOpenCodeZen = updated.providers.some(
+        (provider) => provider.id === "opencode" || provider.id === "opencode-zen-free",
+      );
       const first = updated.providers.find((provider) => provider.id === updated.selectedProviderId)
         ?? updated.providers.find((provider) => provider.models.length > 0);
       if (first) {
@@ -741,7 +746,14 @@ function App() {
       }
       const availableModels = updated.providers.reduce((count, provider) => count + provider.models.length, 0);
       setNotice(`${updated.providers.length} compte(s) importé(s), ${availableModels} modèle(s) disponible(s).`);
-      if (first && first.modelsError) setError(`${first.name} : ${first.modelsError}`);
+      const zenError = updated.providers.find(
+        (provider) => provider.id === "opencode-zen-free" && provider.modelsError,
+      );
+      if (zenError?.modelsError) setError(`${zenError.name} : ${zenError.modelsError}`);
+      else if (first && first.modelsError) setError(`${first.name} : ${first.modelsError}`);
+      else if (!hasOpenCodeZen) {
+        setError("Le fournisseur OpenCode Zen n’a pas pu être ajouté. Vérifie que le CLI OpenCode est accessible depuis LUCY, puis relance l’import.");
+      }
     } catch (reason) {
       setError(friendlyError(reason));
     } finally {
@@ -1087,8 +1099,8 @@ function App() {
   }
 
   return (
-    <main className="app-shell">
-      <header className="titlebar" data-tauri-drag-region>
+    <main className={`app-shell ${appState.isHyprlandSession ? "hyprland-session" : ""}`}>
+      {!appState.isHyprlandSession && <header className="titlebar" data-tauri-drag-region>
         <div className="brand-lockup" data-tauri-drag-region>
           <span className="brand-mark">L</span><span className="brand-name">LUCY</span>
         </div>
@@ -1097,7 +1109,7 @@ function App() {
           <button aria-label="Agrandir" onClick={() => void windowControls?.toggleMaximize()}>□</button>
           <button className="close-control" aria-label="Fermer" onClick={() => void windowControls?.close()}>×</button>
         </div>
-      </header>
+      </header>}
 
       <section className="workspace">
         <aside className="sidebar">
@@ -1120,8 +1132,7 @@ function App() {
             {visibleSessions.length === 0 && <p className="empty-side">{ready ? "Aucune session pour l’instant." : "Chargement…"}</p>}
           </nav>
           <div className="sidebar-bottom">
-            <div className="provider-status"><span className="status-led" /><span>{appState.providers.length} FOURNISSEUR{appState.providers.length === 1 ? "" : "S"} LOCAL{appState.providers.length === 1 ? "" : "AUX"}</span></div>
-            <button className="settings-button" onClick={() => setShowNameDialog(true)}><span>◉</span> TON NOM · {currentUserName || "À CONFIGURER"}</button>
+            <div className="provider-status"><span className="status-led" /><span>{appState.providers.length} FOURNISSEUR{appState.providers.length === 1 ? "" : "S"} LOCA{appState.providers.length === 1 ? "L" : "UX"}</span></div>
             <button className="settings-button" onClick={() => setShowProvider(true)}><span>＋</span> FOURNISSEURS & MODÈLES</button>
           </div>
         </aside>
@@ -1136,19 +1147,6 @@ function App() {
           </div>
 
           {(error || notice || retryStatus) && <div className={retryStatus && !error ? "error-banner retry-banner" : error ? "error-banner" : "notice-banner"} role="status" aria-live="polite"><span>{retryStatus && !error ? `${currentProvider?.name ?? "Fournisseur"} temporairement indisponible (${retryStatus.reason}). Nouvelle tentative ${retryStatus.attempt}/${retryStatus.maxRetries} dans ${Math.max(0, Math.ceil((retryStatus.retryAt - retryClock) / 1000))} s…` : error || notice}</span><button onClick={() => { setError(""); setNotice(""); }} aria-label="Fermer">×</button></div>}
-
-          {showNameDialog && <div className="modal-backdrop profile-backdrop">
-            <form className="modal-card profile-modal" onSubmit={(event) => void saveUserName(event)}>
-              <div className="modal-kicker">LUCY // ENTRE NOUS</div>
-              {currentUserName && <button type="button" className="modal-close" onClick={() => setShowNameDialog(false)}>×</button>}
-              <h2>Comment tu t’appelles ?</h2>
-              <p>Je garde ton prénom uniquement sur cet ordinateur. Comme ça, je peux te parler plus naturellement.</p>
-              <label className="field-label" htmlFor="user-name">TON PRÉNOM OU SURNOM</label>
-              <input id="user-name" autoFocus autoComplete="given-name" value={userNameInput} onChange={(event) => setUserNameInput(event.target.value)} placeholder="Prénom ou surnom" maxLength={60} required />
-              <button className="approve-button provider-save" disabled={savingUserName || !userNameInput.trim()}>{savingUserName ? "ENREGISTREMENT…" : "C’EST NOTÉ ↗"}</button>
-              <span className="modal-foot">STOCKAGE LOCAL · MODIFIABLE À TOUT MOMENT</span>
-            </form>
-          </div>}
 
           {!ready ? (
             <div className="empty-chat"><span className="empty-symbol">◌</span><p>INITIALISATION DU SYSTÈME LOCAL…</p></div>
@@ -1296,7 +1294,7 @@ function App() {
           <div className="modal-kicker">CONNEXIONS // CONFIGURATION LOCALE</div><button className="modal-close" onClick={() => setShowProvider(false)}>×</button><h2>Choisir ton modèle.</h2>
           <p>Importe tes clés API OpenCode ou connecte une API compatible OpenAI — notamment Ollama, sans connexion cloud.</p>
           <button className="primary-button modal-submit" disabled={busy} onClick={() => void importProviders()}>{busy ? "IMPORT EN COURS…" : "↻ IMPORTER AUTOMATIQUEMENT LES COMPTES EXISTANTS"}</button>
-          {appState.providers.map((provider) => <div className="provider-card" key={provider.id}><div><strong>{provider.name}</strong><small>{provider.baseUrl} · {provider.models.length} modèle(s) · {provider.source === "oauth" ? "OAuth importé" : provider.source === "import" ? "importé depuis OpenCode" : "configuré localement"}</small>{provider.modelsError && <small className="provider-error">{provider.modelsError}</small>}</div><div className="provider-actions"><button onClick={() => { setProviderId(provider.id); void refreshModels(provider.id); }}>MODÈLES ↻</button><button className="remove-provider" onClick={() => void deleteProvider(provider.id)}>×</button></div></div>)}
+          {appState.providers.map((provider) => <div className="provider-card" key={provider.id}><div><strong>{provider.name}</strong><small>{provider.baseUrl} · {provider.models.length} modèle(s) · {provider.source === "opencode-free" ? "gratuit via OpenCode local · outils activés selon le mode" : provider.source === "oauth" ? "OAuth importé" : provider.source === "import" ? "importé depuis OpenCode" : "configuré localement"}</small>{provider.modelsError && <small className="provider-error">{provider.modelsError}</small>}</div><div className="provider-actions"><button onClick={() => { setProviderId(provider.id); void refreshModels(provider.id); }}>MODÈLES ↻</button><button className="remove-provider" onClick={() => void deleteProvider(provider.id)}>×</button></div></div>)}
           <form onSubmit={(event) => void saveProvider(event)} className="provider-form">
             <label className="field-label">NOM DE LA CONNEXION</label><input value={providerForm.name} onChange={(event) => setProviderForm((form) => ({ ...form, name: event.target.value, id: form.id || event.target.value.toLowerCase().replaceAll(" ", "-") }))} placeholder="Ollama local, OpenAI…" required />
             <label className="field-label">BASE URL (OPENAI-COMPATIBLE)</label><input value={providerForm.baseUrl} onChange={(event) => setProviderForm((form) => ({ ...form, baseUrl: event.target.value }))} placeholder="http://127.0.0.1:11434/v1" required />

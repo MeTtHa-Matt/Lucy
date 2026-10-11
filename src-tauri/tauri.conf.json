@@ -15,8 +15,8 @@
         "title": "LUCY // Neural Interface",
         "width": 1440,
         "height": 920,
-        "minWidth": 1080,
-        "minHeight": 680,
+        "minWidth": 700,
+        "minHeight": 560,
         "decorations": false,
         "backgroundColor": "#09090b"
       }

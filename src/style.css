@@ -23,8 +23,8 @@
 
 body {
   margin: 0;
-  min-width: 1080px;
-  min-height: 680px;
+  min-width: 0;
+  min-height: 0;
   overflow: hidden;
   background:
     radial-gradient(ellipse at 55% 8%, rgba(84, 16, 33, 0.1), transparent 43%),
@@ -55,7 +55,7 @@ button:disabled {
 
 .app-shell {
   height: 100vh;
-  min-height: 680px;
+  min-height: 0;
   display: flex;
   flex-direction: column;
   border: 1px solid #242025;
@@ -446,7 +446,7 @@ button:disabled {
   display: flex;
   flex: 1;
   flex-direction: column;
-  min-width: 450px;
+  min-width: 0;
   background:
     radial-gradient(ellipse at 48% 0, rgba(82, 19, 34, 0.08), transparent 55%),
     #0b0a0d;
@@ -1766,14 +1766,6 @@ details.tool-card summary {
   box-shadow: 0 18px 90px #000;
 }
 
-.profile-backdrop {
-  z-index: 30;
-}
-
-.profile-modal {
-  width: min(440px, calc(100vw - 60px));
-}
-
 .provider-card {
   display: flex;
   align-items: center;
@@ -2030,5 +2022,193 @@ details.tool-card summary {
 
   .agent-select {
     max-width: 100px;
+  }
+}
+
+@media (max-width: 900px) {
+  .workspace {
+    flex-direction: column;
+    overflow: auto;
+  }
+
+  .sidebar {
+    width: 100%;
+    min-width: 0;
+    display: grid;
+    flex: 0 0 auto;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 6px;
+    padding: 8px;
+    border-right: 0;
+    border-bottom: 1px solid var(--line);
+  }
+
+  .sidebar-heading,
+  .sidebar-section-title {
+    display: none;
+  }
+
+  .project-button,
+  .new-session {
+    min-width: 0;
+    min-height: 34px;
+    margin: 0;
+    overflow: hidden;
+    padding: 0 6px;
+    font-size: 8px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .search-box {
+    grid-column: 1 / -1;
+  }
+
+  .session-list {
+    grid-column: 1 / -1;
+    flex-direction: row;
+    min-width: 0;
+    max-height: 42px;
+    margin: 0;
+    overflow-x: auto;
+  }
+
+  .session-row {
+    flex: 0 0 190px;
+  }
+
+  .sidebar-bottom {
+    grid-column: 1 / -1;
+    flex-direction: row;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    margin: 0;
+  }
+
+  .provider-status {
+    min-width: 0;
+    padding: 6px 2px;
+    border: 0;
+    font-size: 7px;
+  }
+
+  .settings-button {
+    min-width: 0;
+    overflow: hidden;
+    padding: 6px;
+    font-size: 8px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .center-pane {
+    min-height: 440px;
+  }
+
+  .inspector {
+    width: 100%;
+    min-width: 0;
+    height: 230px;
+    min-height: 230px;
+    border-top: 1px solid var(--line);
+    border-left: 0;
+  }
+
+  .composer-wrap {
+    padding: 9px 14px 12px;
+  }
+
+  .composer-bottom {
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+
+  .composer-bottom .model-select {
+    flex: 1 1 180px;
+    max-width: none;
+    min-width: 0;
+  }
+
+  .composer-bottom .agent-select {
+    flex: 0 1 90px;
+    min-width: 75px;
+  }
+
+  .composer-hint {
+    display: none;
+  }
+}
+
+@media (max-width: 560px) {
+  .titlebar {
+    padding-left: 9px;
+  }
+
+  .window-controls button {
+    width: 34px;
+  }
+
+  .sidebar {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .skills-button {
+    grid-column: 1 / -1;
+  }
+
+  .provider-status {
+    font-size: 6px;
+    letter-spacing: 0.04em;
+  }
+
+  .settings-button {
+    font-size: 7px;
+    letter-spacing: 0.04em;
+  }
+
+  .center-pane {
+    min-height: 400px;
+  }
+
+  .topbar {
+    height: 44px;
+    min-height: 44px;
+    padding: 0 8px;
+  }
+
+  .breadcrumb {
+    gap: 5px;
+    font-size: 8px;
+  }
+
+  .composer-wrap {
+    padding: 7px 8px 9px;
+  }
+
+  .composer-shortcuts {
+    font-size: 7px;
+  }
+
+  .composer-shortcuts span:first-child {
+    display: none;
+  }
+
+  .chat-scroll {
+    padding-right: 9px;
+    padding-left: 9px;
+  }
+
+  .statusbar {
+    padding: 0 7px;
+    font-size: 7px;
+  }
+
+  .status-right {
+    gap: 6px;
+  }
+
+  .status-right span:nth-child(2) {
+    display: none;
   }
 }
