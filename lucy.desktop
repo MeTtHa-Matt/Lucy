@@ -1,0 +1,10 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=LUCY
+Comment=Assistant IA autonome pour le développement
+Exec=lucy
+Icon=lucy
+Terminal=false
+Categories=Development;Utility;
+StartupWMClass=lucy

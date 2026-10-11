@@ -1,0 +1,2693 @@
+use std::{
+    collections::BTreeMap,
+    fs::{self, OpenOptions},
+    io::Write,
+    path::{Path, PathBuf},
+    process::Command,
+    sync::Mutex,
+    time::Duration,
+};
+
+use futures_util::StreamExt;
+use reqwest::{header, Client};
+use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
+use tauri::{AppHandle, Emitter, Manager, State};
+use tokio::{
+    process::Command as TokioCommand,
+    sync::{oneshot, watch},
+};
+use uuid::Uuid;
+
+const CHAT_UPDATE: &str = "chat:update";
+const TOOL_APPROVAL: &str = "tool:approval";
+const MAX_SESSIONS: usize = 100;
+const MAX_TOOL_ROUNDS: usize = 8;
+const MAX_REQUEST_RETRIES: u32 = 10;
+const MAX_RETRY_DELAY_SECONDS: u64 = 300;
+const DEFAULT_PROJECT_PATH: &str = "/home/Matthew";
+
+fn default_mode() -> String {
+    "build".into()
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StoredProvider {
+    id: String,
+    name: String,
+    base_url: String,
+    api_key: String,
+    models: Vec<String>,
+    #[serde(default)]
+    source: String,
+    #[serde(default)]
+    access_token_expires_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    models_error: Option<String>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ChatMessage {
+    id: String,
+    role: String,
+    text: String,
+    created_at: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    tool_calls: Vec<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tool_call_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Map::is_empty")]
+    provider_metadata: Map<String, Value>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ChatSession {
+    id: String,
+    title: String,
+    project_path: String,
+    provider_id: String,
+    model_id: String,
+    #[serde(default = "default_mode")]
+    mode: String,
+    #[serde(default)]
+    allow_all_tools: bool,
+    messages: Vec<ChatMessage>,
+    created_at: u64,
+    updated_at: u64,
+}
+
+#[derive(Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LocalStore {
+    project_path: Option<String>,
+    providers: Vec<StoredProvider>,
+    sessions: Vec<ChatSession>,
+    #[serde(default)]
+    selected_provider_id: Option<String>,
+    #[serde(default)]
+    selected_model_id: Option<String>,
+}
+
+struct AppState {
+    store: Mutex<LocalStore>,
+    storage_path: PathBuf,
+    pending_approvals: Mutex<BTreeMap<String, PendingApproval>>,
+    active_generations: Mutex<BTreeMap<String, watch::Sender<bool>>>,
+}
+
+struct PendingApproval {
+    session_id: String,
+    sender: oneshot::Sender<bool>,
+}
+
+struct ActiveGeneration<'a> {
+    state: &'a AppState,
+    session_id: String,
+}
+
+impl Drop for ActiveGeneration<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut active) = self.state.active_generations.lock() {
+            active.remove(&self.session_id);
+        }
+    }
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PublicProvider {
+    id: String,
+    name: String,
+    base_url: String,
+    models: Vec<String>,
+    source: String,
+    access_token_expires_at: Option<u64>,
+    models_error: Option<String>,
+}
+
+impl From<&StoredProvider> for PublicProvider {
+    fn from(provider: &StoredProvider) -> Self {
+        Self {
+            id: provider.id.clone(),
+            name: provider.name.clone(),
+            base_url: provider.base_url.clone(),
+            models: provider.models.clone(),
+            source: provider.source.clone(),
+            access_token_expires_at: provider.access_token_expires_at,
+            models_error: provider.models_error.clone(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PublicState {
+    project_path: Option<String>,
+    providers: Vec<PublicProvider>,
+    sessions: Vec<ChatSession>,
+    selected_provider_id: Option<String>,
+    selected_model_id: Option<String>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ChatUpdate {
+    session_id: String,
+    message_id: String,
+    kind: String,
+    delta: String,
+    error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    details: Option<Value>,
+}
+
+fn retry_delay_seconds(retry_number: u32, retry_after: Option<u64>) -> u64 {
+    let exponential = 2_u64
+        .saturating_pow(retry_number)
+        .min(MAX_RETRY_DELAY_SECONDS);
+    retry_after
+        .unwrap_or_default()
+        .max(exponential)
+        .min(MAX_RETRY_DELAY_SECONDS)
+}
+
+fn is_retryable_status(status: reqwest::StatusCode) -> bool {
+    matches!(status.as_u16(), 429 | 500 | 502 | 503 | 504)
+}
+
+fn emit_retry_status(
+    app: &AppHandle,
+    session_id: &str,
+    message_id: &str,
+    attempt: u32,
+    delay_seconds: u64,
+    reason: Option<&str>,
+    active: bool,
+) {
+    let _ = app.emit(
+        CHAT_UPDATE,
+        ChatUpdate {
+            session_id: session_id.to_string(),
+            message_id: message_id.to_string(),
+            kind: "retry".into(),
+            delta: String::new(),
+            error: reason.map(str::to_string),
+            details: Some(serde_json::json!({
+                "active": active,
+                "attempt": attempt,
+                "maxRetries": MAX_REQUEST_RETRIES,
+                "retryAfterSeconds": delay_seconds,
+            })),
+        },
+    );
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ToolApproval {
+    id: String,
+    session_id: String,
+    project_path: String,
+    tool_name: String,
+    arguments: Value,
+}
+
+#[derive(Deserialize)]
+struct IncomingToolCall {
+    id: String,
+    function: IncomingToolFunction,
+}
+
+#[derive(Deserialize)]
+struct IncomingToolFunction {
+    name: String,
+    arguments: String,
+}
+
+struct StreamedToolCall {
+    id: String,
+    name: String,
+    arguments: String,
+    metadata: Map<String, Value>,
+}
+
+fn merge_stream_fragment(target: &mut String, fragment: &str) {
+    if fragment.is_empty() || target == fragment || target.starts_with(fragment) {
+        return;
+    }
+    if fragment.starts_with(target.as_str()) {
+        target.clear();
+        target.push_str(fragment);
+    } else {
+        target.push_str(fragment);
+    }
+}
+
+fn normalize_tool_name(name: &str) -> String {
+    let midpoint = name.len() / 2;
+    if name.len() % 2 == 0 {
+        let (first, second) = name.split_at(midpoint);
+        if first == second
+            && matches!(
+                first,
+                "read_file" | "list_files" | "run_shell" | "write_file"
+            )
+        {
+            return first.to_string();
+        }
+    }
+    name.to_string()
+}
+
+fn normalize_tool_arguments(arguments: &str) -> String {
+    let mut stream = serde_json::Deserializer::from_str(arguments).into_iter::<Value>();
+    let Ok(Some(first)) = stream.next().transpose() else {
+        return arguments.to_string();
+    };
+    let consumed = stream.byte_offset();
+    let remainder = arguments[consumed..].trim();
+    if !remainder.is_empty() && remainder == arguments[..consumed].trim() {
+        first.to_string()
+    } else {
+        arguments.to_string()
+    }
+}
+
+fn merge_json_value(target: &mut Value, source: Value) {
+    if let (Some(target), Some(source)) = (target.as_object_mut(), source.as_object()) {
+        for (key, value) in source {
+            merge_json_value(
+                target.entry(key.clone()).or_insert(Value::Null),
+                value.clone(),
+            );
+        }
+    } else {
+        *target = source;
+    }
+}
+
+fn merge_provider_metadata(target: &mut Map<String, Value>, source: &Value) {
+    let Some(source) = source.as_object() else {
+        return;
+    };
+    for (key, value) in source {
+        if matches!(
+            key.as_str(),
+            "content" | "tool_calls" | "role" | "function_call" | "refusal" | "reasoning_content"
+        ) {
+            continue;
+        }
+        merge_json_value(
+            target.entry(key.clone()).or_insert(Value::Null),
+            value.clone(),
+        );
+    }
+}
+
+fn streamed_tool_index(
+    call: &Value,
+    tool_calls: &BTreeMap<usize, StreamedToolCall>,
+) -> Result<usize, String> {
+    if let Some(index) = call["index"].as_u64() {
+        return Ok(index as usize);
+    }
+
+    if let Some(id) = call["id"].as_str().filter(|id| !id.is_empty()) {
+        if let Some((index, _)) = tool_calls.iter().find(|(_, tool)| tool.id == id) {
+            return Ok(*index);
+        }
+    }
+
+    let name = call["function"]["name"]
+        .as_str()
+        .filter(|name| !name.is_empty());
+    if let Some(name) = name {
+        let matches: Vec<usize> = tool_calls
+            .iter()
+            .filter(|(_, tool)| {
+                !tool.name.is_empty()
+                    && (tool.name == name
+                        || tool.name.starts_with(name)
+                        || name.starts_with(&tool.name))
+            })
+            .map(|(index, _)| *index)
+            .collect();
+        if matches.len() == 1 {
+            return Ok(matches[0]);
+        }
+        if matches.len() > 1 {
+            return Err(
+                "Le fournisseur a renvoyé plusieurs outils sans index et leurs noms sont ambigus."
+                    .into(),
+            );
+        }
+        return Ok((0..)
+            .find(|index| !tool_calls.contains_key(index))
+            .unwrap_or(0));
+    }
+
+    match tool_calls.len() {
+        0 => Ok(0),
+        _ => Ok(*tool_calls
+            .keys()
+            .next_back()
+            .expect("at least one tool call is present")),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProviderInput {
+    id: String,
+    name: String,
+    base_url: String,
+    api_key: String,
+    models: Vec<String>,
+}
+
+fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+fn save_store(state: &AppState, store: &LocalStore) -> Result<(), String> {
+    let parent = state
+        .storage_path
+        .parent()
+        .ok_or_else(|| "Dossier de sauvegarde LUCY invalide.".to_string())?;
+    fs::create_dir_all(parent).map_err(|error| {
+        format!("Impossible de créer le dossier de configuration LUCY : {error}")
+    })?;
+    let temporary_path = state.storage_path.with_extension("json.tmp");
+    let content = serde_json::to_vec_pretty(store)
+        .map_err(|error| format!("Impossible de sérialiser les données LUCY : {error}"))?;
+    let mut options = OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(&temporary_path)
+        .map_err(|error| format!("Impossible de sauvegarder les données LUCY : {error}"))?;
+    file.write_all(&content)
+        .and_then(|()| file.sync_all())
+        .map_err(|error| format!("Impossible d'écrire la sauvegarde LUCY : {error}"))?;
+    drop(file);
+    fs::rename(&temporary_path, &state.storage_path)
+        .map_err(|error| format!("Impossible d'installer la sauvegarde LUCY : {error}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&state.storage_path, fs::Permissions::from_mode(0o600))
+            .map_err(|error| format!("Impossible de protéger les identifiants LUCY : {error}"))?;
+    }
+    Ok(())
+}
+
+fn read_store(path: &Path) -> Result<LocalStore, String> {
+    match fs::read(path) {
+        Ok(content) => {
+            let mut store: LocalStore = serde_json::from_slice(&content).map_err(|error| {
+                format!("Les données enregistrées par LUCY sont invalides : {error}")
+            })?;
+            if store.project_path.is_none() && Path::new(DEFAULT_PROJECT_PATH).is_dir() {
+                store.project_path = Some(DEFAULT_PROJECT_PATH.into());
+            }
+            Ok(store)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(LocalStore {
+            project_path: Some(if Path::new(DEFAULT_PROJECT_PATH).is_dir() {
+                DEFAULT_PROJECT_PATH.into()
+            } else {
+                std::env::current_dir()
+                    .map_err(|reason| {
+                        format!("Impossible de trouver le dossier courant : {reason}")
+                    })?
+                    .display()
+                    .to_string()
+            }),
+            ..LocalStore::default()
+        }),
+        Err(error) => Err(format!(
+            "Impossible de lire les données enregistrées par LUCY : {error}"
+        )),
+    }
+}
+
+fn public_state(store: &LocalStore) -> PublicState {
+    PublicState {
+        project_path: store.project_path.clone(),
+        providers: store.providers.iter().map(PublicProvider::from).collect(),
+        sessions: store.sessions.clone(),
+        selected_provider_id: store.selected_provider_id.clone(),
+        selected_model_id: store.selected_model_id.clone(),
+    }
+}
+
+fn provider_base_url(id: &str) -> Option<&'static str> {
+    match id {
+        "github-copilot" => Some("https://api.githubcopilot.com"),
+        "google" | "google-vertex" | "google-vertex-anthropic" => {
+            Some("https://generativelanguage.googleapis.com/v1beta/openai")
+        }
+        "groq" => Some("https://api.groq.com/openai/v1"),
+        "openai" => Some("https://api.openai.com/v1"),
+        "openrouter" => Some("https://openrouter.ai/api/v1"),
+        "deepseek" => Some("https://api.deepseek.com/v1"),
+        "mistral" => Some("https://api.mistral.ai/v1"),
+        "xai" => Some("https://api.x.ai/v1"),
+        "together" => Some("https://api.together.xyz/v1"),
+        "fireworks" => Some("https://api.fireworks.ai/inference/v1"),
+        "cerebras" => Some("https://api.cerebras.ai/v1"),
+        "perplexity" => Some("https://api.perplexity.ai"),
+        "ollama" => Some("http://127.0.0.1:11434/v1"),
+        _ => None,
+    }
+}
+
+fn imported_provider(input: &serde_json::Value) -> Option<StoredProvider> {
+    let id = input.get("integrationID")?.as_str()?;
+    let value = input.get("value")?;
+    let credential_type = value.get("type")?.as_str()?;
+    if !matches!(credential_type, "key" | "api" | "oauth") {
+        return None;
+    }
+    let token = value
+        .get("key")
+        .or_else(|| value.get("access"))?
+        .as_str()?
+        .trim()
+        .to_string();
+    if token.is_empty() {
+        return None;
+    }
+    let base_url = provider_base_url(id)?;
+    let name = match id {
+        "github-copilot" => "GitHub Copilot".to_string(),
+        "google" | "google-vertex" | "google-vertex-anthropic" => "Google AI".to_string(),
+        "groq" => "Groq".to_string(),
+        _ => id.to_string(),
+    };
+    Some(StoredProvider {
+        id: id.to_string(),
+        name,
+        base_url: base_url.to_string(),
+        api_key: token,
+        models: Vec::new(),
+        source: if credential_type == "oauth" {
+            "oauth"
+        } else {
+            "import"
+        }
+        .to_string(),
+        access_token_expires_at: value.get("expires").and_then(serde_json::Value::as_u64),
+        models_error: None,
+    })
+}
+
+fn provider_request(
+    client: &Client,
+    provider: &StoredProvider,
+    path: &str,
+) -> reqwest::RequestBuilder {
+    let url = format!(
+        "{}/{}",
+        provider.base_url.trim_end_matches('/'),
+        path.trim_start_matches('/')
+    );
+    let mut request = client.get(&url);
+    if !provider.api_key.is_empty() {
+        request = request.bearer_auth(&provider.api_key);
+    }
+    if provider.id == "github-copilot" {
+        request = request
+            .header("editor-version", "vscode/1.85.1")
+            .header("editor-plugin-version", "copilot/1.155.0")
+            .header("copilot-integration-id", "vscode-chat")
+            .header("openai-intent", "conversation-panel");
+    }
+    request
+}
+
+fn tool_definitions(mode: &str) -> Value {
+    let mut tools = vec![
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "description": "Read a UTF-8 file inside the user's selected project.",
+                "parameters": {
+                    "type": "object",
+                    "properties": { "path": { "type": "string", "description": "Project-relative file path" } },
+                    "required": ["path"],
+                    "additionalProperties": false
+                }
+            }
+        }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "list_files",
+                "description": "List files inside a directory of the selected project.",
+                "parameters": {
+                    "type": "object",
+                    "properties": { "path": { "type": "string", "description": "Project-relative directory path; default to the project root" } },
+                    "additionalProperties": false
+                }
+            }
+        }),
+    ];
+    if mode == "build" {
+        tools.extend([
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "run_shell",
+                "description": "Run a shell command in the user's selected project. The user must approve it, unless whole-session approval was granted.",
+                "parameters": {
+                    "type": "object",
+                    "properties": { "command": { "type": "string", "description": "The shell command to run" } },
+                    "required": ["command"],
+                    "additionalProperties": false
+                }
+            }
+        }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "write_file",
+                "description": "Write a UTF-8 file inside the user's selected project. Ask for confirmation before changing this file.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "Project-relative file path" },
+                        "content": { "type": "string", "description": "Complete new file content" }
+                    },
+                    "required": ["path", "content"],
+                    "additionalProperties": false
+                }
+            }
+        }),
+        ]);
+    }
+    Value::Array(tools)
+}
+
+fn project_context(project_path: &str) -> Result<Value, String> {
+    let project = Path::new(project_path)
+        .canonicalize()
+        .map_err(|error| format!("Impossible de résoudre le dossier de contexte : {error}"))?;
+    let mut files = Vec::new();
+    let mut pending = vec![project.clone()];
+    while let Some(directory) = pending.pop() {
+        for entry in fs::read_dir(&directory)
+            .map_err(|error| format!("Impossible de lire le contexte du projet : {error}"))?
+        {
+            let entry = entry
+                .map_err(|error| format!("Impossible de lire une entrée du projet : {error}"))?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if matches!(
+                name.as_str(),
+                ".git"
+                    | "node_modules"
+                    | "target"
+                    | "dist"
+                    | "build"
+                    | ".cache"
+                    | ".venv"
+                    | ".npm"
+                    | ".cargo"
+                    | ".rustup"
+                    | ".var"
+                    | ".docker"
+                    | ".vscode-server"
+                    | ".gradle"
+                    | ".m2"
+                    | "snap"
+                    | ".ssh"
+                    | ".gnupg"
+                    | ".config"
+                    | ".local"
+                    | "Downloads"
+                    | "Documents"
+                    | "Pictures"
+                    | "Videos"
+                    | "Music"
+            ) {
+                continue;
+            }
+            let path = entry.path();
+            let relative = path
+                .strip_prefix(&project)
+                .map_err(|error| format!("Chemin de contexte invalide : {error}"))?;
+            if ensure_non_sensitive_path(relative).is_err() {
+                continue;
+            }
+            let metadata = fs::symlink_metadata(&path).map_err(|error| {
+                format!("Impossible de lire les métadonnées du projet : {error}")
+            })?;
+            if metadata.file_type().is_symlink() {
+                continue;
+            }
+            if metadata.is_dir() {
+                pending.push(path);
+            } else if metadata.is_file() {
+                files.push(relative.to_string_lossy().replace('\\', "/"));
+                if files.len() >= 2_000 {
+                    break;
+                }
+            }
+        }
+        if files.len() >= 2_000 {
+            break;
+        }
+    }
+    files.sort();
+    let mut instructions = String::new();
+    for instruction in ["AGENTS.md", ".github/copilot-instructions.md"] {
+        let path = project.join(instruction);
+        if let Ok(metadata) = fs::symlink_metadata(&path) {
+            if metadata.is_file() && !metadata.file_type().is_symlink() && metadata.len() <= 100_000
+            {
+                let contents = fs::read_to_string(&path).map_err(|error| {
+                    format!("Impossible de lire les instructions {instruction} : {error}")
+                })?;
+                instructions.push_str(&format!("\n\n--- {instruction} ---\n{contents}"));
+            }
+        }
+    }
+    for manifest in [
+        "package.json",
+        "Cargo.toml",
+        "pyproject.toml",
+        "go.mod",
+        "composer.json",
+        "README.md",
+    ] {
+        let path = project.join(manifest);
+        if let Ok(metadata) = fs::symlink_metadata(&path) {
+            if metadata.is_file() && !metadata.file_type().is_symlink() && metadata.len() <= 20_000
+            {
+                let contents = fs::read_to_string(&path).map_err(|error| {
+                    format!("Impossible de lire le fichier de contexte {manifest} : {error}")
+                })?;
+                instructions.push_str(&format!("\n\n--- {manifest} ---\n{contents}"));
+            }
+        }
+    }
+    Ok(serde_json::json!({
+        "projectPath": project.display().to_string(),
+        "files": files,
+        "instructions": instructions,
+        "truncated": files.len() >= 2_000,
+    }))
+}
+
+fn validate_path(project_path: &str, requested_path: &str) -> Result<PathBuf, String> {
+    let project = PathBuf::from(project_path)
+        .canonicalize()
+        .map_err(|error| format!("Dossier de projet introuvable : {error}"))?;
+    let requested = PathBuf::from(requested_path);
+    let joined = if requested.is_absolute() {
+        requested
+    } else {
+        project.join(requested)
+    };
+    let target = joined
+        .canonicalize()
+        .map_err(|error| format!("Fichier ou dossier introuvable : {error}"))?;
+    if !target.starts_with(&project) {
+        return Err("L’accès aux fichiers situés hors du projet est refusé.".into());
+    }
+    let relative = target
+        .strip_prefix(&project)
+        .map_err(|error| format!("Chemin de projet invalide : {error}"))?;
+    ensure_non_sensitive_path(relative)?;
+    Ok(target)
+}
+
+fn ensure_non_sensitive_path(path: &Path) -> Result<(), String> {
+    let parts: Vec<String> = path
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy().to_lowercase())
+        .collect();
+    let protected_directories = [
+        ".ssh",
+        ".gnupg",
+        ".aws",
+        ".azure",
+        ".kube",
+        ".config",
+        ".local",
+        ".password-store",
+        ".mozilla",
+    ];
+    if parts
+        .iter()
+        .any(|part| protected_directories.contains(&part.as_str()))
+    {
+        return Err(
+            "L’accès aux dossiers de configuration et d’identifiants personnels est bloqué.".into(),
+        );
+    }
+    if let Some(name) = parts.last() {
+        let protected_file = name == ".env"
+            || (name.starts_with(".env.")
+                && !matches!(
+                    name.as_str(),
+                    ".env.example" | ".env.sample" | ".env.template"
+                ))
+            || matches!(
+                name.as_str(),
+                ".netrc" | ".npmrc" | ".pypirc" | ".git-credentials" | "id_rsa" | "id_ed25519"
+            )
+            || name.ends_with(".pem")
+            || name.ends_with(".key");
+        if protected_file {
+            return Err(
+                "L’accès aux fichiers susceptibles de contenir des secrets est bloqué.".into(),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn execute_file_write(
+    project_path: &str,
+    requested_path: &str,
+    content: &str,
+) -> Result<String, String> {
+    if content.len() > 1_000_000 {
+        return Err("Écriture refusée : la limite est de 1 Mo par fichier.".into());
+    }
+    let project = PathBuf::from(project_path)
+        .canonicalize()
+        .map_err(|error| format!("Dossier de projet introuvable : {error}"))?;
+    let requested = PathBuf::from(requested_path);
+    let target = if requested.is_absolute() {
+        requested
+    } else {
+        project.join(requested)
+    };
+    match fs::symlink_metadata(&target) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err("L’écriture d’un lien symbolique est refusée.".into());
+        }
+        Ok(_) => {
+            let existing = target
+                .canonicalize()
+                .map_err(|error| format!("Chemin de fichier invalide : {error}"))?;
+            if !existing.starts_with(&project) {
+                return Err("L’accès aux fichiers situés hors du projet est refusé.".into());
+            }
+            ensure_non_sensitive_path(
+                existing
+                    .strip_prefix(&project)
+                    .map_err(|error| format!("Chemin de projet invalide : {error}"))?,
+            )?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let parent = target
+                .parent()
+                .ok_or_else(|| "Chemin de fichier invalide.".to_string())?
+                .canonicalize()
+                .map_err(|error| format!("Le dossier parent n'existe pas : {error}"))?;
+            if !parent.starts_with(&project) {
+                return Err("L’accès aux fichiers situés hors du projet est refusé.".into());
+            }
+            ensure_non_sensitive_path(
+                parent
+                    .strip_prefix(&project)
+                    .map_err(|error| format!("Chemin de projet invalide : {error}"))?,
+            )?;
+            if let Some(name) = target.file_name() {
+                ensure_non_sensitive_path(Path::new(name))?;
+            }
+        }
+        Err(error) => return Err(format!("Impossible de vérifier le chemin : {error}")),
+    }
+    fs::write(&target, content)
+        .map_err(|error| format!("Impossible d’écrire le fichier : {error}"))?;
+    Ok(format!("Fichier mis à jour : {}", target.display()))
+}
+
+async fn execute_shell(project_path: &str, command: &str) -> Result<String, String> {
+    if command.trim().is_empty() {
+        return Err("Saisis une commande à exécuter.".into());
+    }
+    let mut child = TokioCommand::new("sh");
+    child
+        .args(["-lc", command])
+        .current_dir(project_path)
+        .kill_on_drop(true);
+    let output = tokio::time::timeout(Duration::from_secs(60), child.output())
+        .await
+        .map_err(|_| "La commande a dépassé la limite de 60 secondes.".to_string())?
+        .map_err(|error| format!("Impossible de démarrer la commande : {error}"))?;
+    let mut result = String::from_utf8_lossy(&output.stdout).into_owned();
+    result.push_str(&String::from_utf8_lossy(&output.stderr));
+    if result.chars().count() > 20_000 {
+        result = format!(
+            "{}…\n[sortie tronquée]",
+            result.chars().take(20_000).collect::<String>()
+        );
+    }
+    if !output.status.success() {
+        return Err(format!(
+            "La commande s'est terminée avec le code {} :\n{}",
+            output.status, result
+        ));
+    }
+    Ok(result)
+}
+
+async fn request_tool_approval(
+    app: &AppHandle,
+    state: &AppState,
+    session_id: &str,
+    project_path: &str,
+    tool_name: &str,
+    arguments: &Value,
+    mut cancel: watch::Receiver<bool>,
+) -> Result<bool, String> {
+    {
+        let store = state
+            .store
+            .lock()
+            .map_err(|_| "Impossible d’accéder aux données LUCY.".to_string())?;
+        if store
+            .sessions
+            .iter()
+            .any(|session| session.id == session_id && session.allow_all_tools)
+        {
+            return Ok(true);
+        }
+    }
+    let request_id = Uuid::new_v4().to_string();
+    let (sender, receiver) = oneshot::channel();
+    state
+        .pending_approvals
+        .lock()
+        .map_err(|_| "Impossible d’accéder aux demandes d’autorisation.".to_string())?
+        .insert(
+            request_id.clone(),
+            PendingApproval {
+                session_id: session_id.to_string(),
+                sender,
+            },
+        );
+    if let Err(error) = app.emit(
+        TOOL_APPROVAL,
+        ToolApproval {
+            id: request_id.clone(),
+            session_id: session_id.to_string(),
+            project_path: project_path.to_string(),
+            tool_name: tool_name.to_string(),
+            arguments: arguments.clone(),
+        },
+    ) {
+        state
+            .pending_approvals
+            .lock()
+            .map_err(|_| "Impossible d’accéder aux demandes d’autorisation.".to_string())?
+            .remove(&request_id);
+        return Err(format!(
+            "Impossible d’afficher la demande d’autorisation : {error}"
+        ));
+    }
+    let approval = tokio::select! {
+        result = tokio::time::timeout(Duration::from_secs(300), receiver) => result,
+        _ = cancel.changed() => {
+            state
+                .pending_approvals
+                .lock()
+                .map_err(|_| "Impossible d’accéder aux demandes d’autorisation.".to_string())?
+                .remove(&request_id);
+            return Err("Génération arrêtée par l’utilisateur.".into());
+        }
+    };
+    match approval {
+        Ok(Ok(approved)) => Ok(approved),
+        Ok(Err(_)) => Err("La demande d’autorisation a été interrompue.".into()),
+        Err(_) => {
+            state
+                .pending_approvals
+                .lock()
+                .map_err(|_| "Impossible d’accéder aux demandes d’autorisation.".to_string())?
+                .remove(&request_id);
+            Ok(false)
+        }
+    }
+}
+
+#[tauri::command]
+fn resolve_tool_approval(
+    state: State<'_, AppState>,
+    request_id: String,
+    approved: bool,
+    always_allow: bool,
+) -> Result<(), String> {
+    let pending = state
+        .pending_approvals
+        .lock()
+        .map_err(|_| "Impossible d’accéder aux demandes d’autorisation.".to_string())?
+        .remove(&request_id)
+        .ok_or_else(|| "Cette demande n’existe plus ou a expiré.".to_string())?;
+    if approved && always_allow {
+        let mut store = state
+            .store
+            .lock()
+            .map_err(|_| "Impossible d’accéder aux données LUCY.".to_string())?;
+        if let Some(session) = store
+            .sessions
+            .iter_mut()
+            .find(|session| session.id == pending.session_id)
+        {
+            session.allow_all_tools = true;
+            save_store(&state, &store)?;
+        }
+    }
+    pending
+        .sender
+        .send(approved)
+        .map_err(|_| "La génération a été interrompue avant la réponse.".to_string())
+}
+
+async fn execute_tool(
+    app: &AppHandle,
+    state: &AppState,
+    session_id: &str,
+    project_path: &str,
+    call: &IncomingToolCall,
+    cancel: watch::Receiver<bool>,
+) -> Result<String, String> {
+    let arguments: Value = serde_json::from_str(&call.function.arguments)
+        .map_err(|error| format!("Paramètres invalides pour {} : {error}", call.function.name))?;
+    match call.function.name.as_str() {
+        "read_file" => {
+            let path = arguments["path"]
+                .as_str()
+                .ok_or_else(|| "L’outil read_file exige un chemin.".to_string())?;
+            let path = validate_path(project_path, path)?;
+            let metadata = fs::metadata(&path)
+                .map_err(|error| format!("Impossible de lire le fichier : {error}"))?;
+            if !metadata.is_file() || metadata.len() > 1_000_000 {
+                return Err("Lecture refusée : seuls les fichiers classiques de 1 Mo maximum sont autorisés.".into());
+            }
+            fs::read_to_string(&path)
+                .map_err(|error| format!("Lecture du fichier impossible : {error}"))
+        }
+        "list_files" => {
+            let requested = arguments["path"].as_str().unwrap_or(project_path);
+            let project = Path::new(project_path)
+                .canonicalize()
+                .map_err(|error| format!("Dossier de projet introuvable : {error}"))?;
+            let path = validate_path(project_path, requested)?;
+            if !path.is_dir() {
+                return Err("Le chemin à lister n'est pas un dossier.".into());
+            }
+            let mut entries = Vec::new();
+            for entry in fs::read_dir(&path)
+                .map_err(|error| format!("Impossible de lister ce dossier : {error}"))?
+            {
+                let entry =
+                    entry.map_err(|error| format!("Impossible de lire une entrée : {error}"))?;
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let metadata = fs::symlink_metadata(entry.path())
+                    .map_err(|error| format!("Impossible d’identifier une entrée : {error}"))?;
+                let relative = entry
+                    .path()
+                    .strip_prefix(&project)
+                    .map_err(|error| format!("Chemin de projet invalide : {error}"))?
+                    .to_path_buf();
+                if !metadata.file_type().is_symlink()
+                    && ensure_non_sensitive_path(&relative).is_ok()
+                    && !matches!(
+                        name.as_str(),
+                        ".git"
+                            | "node_modules"
+                            | "target"
+                            | "dist"
+                            | ".cache"
+                            | ".venv"
+                            | ".npm"
+                            | ".cargo"
+                            | ".rustup"
+                            | ".var"
+                            | ".docker"
+                            | ".vscode-server"
+                            | ".gradle"
+                            | ".m2"
+                            | "snap"
+                    )
+                {
+                    entries.push(format!(
+                        "{}{}",
+                        name,
+                        if entry.path().is_dir() { "/" } else { "" }
+                    ));
+                }
+            }
+            entries.sort();
+            Ok(entries.join("\n"))
+        }
+        "run_shell" | "write_file" => {
+            let approved = request_tool_approval(
+                app,
+                state,
+                session_id,
+                project_path,
+                &call.function.name,
+                &arguments,
+                cancel.clone(),
+            )
+            .await?;
+            if !approved {
+                return Ok(
+                    "L’utilisateur a refusé cette action. Ne réessaie pas et explique le refus."
+                        .into(),
+                );
+            }
+
+            if call.function.name == "run_shell" {
+                let command = arguments["command"]
+                    .as_str()
+                    .ok_or_else(|| "L’outil run_shell exige une commande.".to_string())?
+                    .to_string();
+                execute_shell(project_path, &command).await
+            } else {
+                let path = arguments["path"]
+                    .as_str()
+                    .ok_or_else(|| "L’outil write_file exige un chemin.".to_string())?;
+                let content = arguments["content"]
+                    .as_str()
+                    .ok_or_else(|| "L’outil write_file exige un contenu.".to_string())?;
+                execute_file_write(project_path, path, content)
+            }
+        }
+        name => Err(format!("Outil inconnu : {name}")),
+    }
+}
+
+fn emit_chat_stopped(app: &AppHandle, session_id: &str) {
+    let _ = app.emit(
+        CHAT_UPDATE,
+        ChatUpdate {
+            session_id: session_id.to_string(),
+            message_id: "stopped".into(),
+            kind: "stopped".into(),
+            delta: String::new(),
+            error: None,
+            details: None,
+        },
+    );
+}
+
+fn discard_incomplete_tool_turn(state: &AppState, session_id: &str) -> Result<(), String> {
+    let mut store = state
+        .store
+        .lock()
+        .map_err(|_| "Impossible d’accéder aux données LUCY.".to_string())?;
+    if let Some(session) = store
+        .sessions
+        .iter_mut()
+        .find(|session| session.id == session_id)
+    {
+        if let Some(index) = session
+            .messages
+            .iter()
+            .rposition(|message| message.role == "assistant" && !message.tool_calls.is_empty())
+        {
+            session.messages.truncate(index);
+            session.updated_at = now_millis();
+            save_store(state, &store)?;
+        }
+    }
+    Ok(())
+}
+
+fn append_session_message(
+    state: &AppState,
+    session_id: &str,
+    message: ChatMessage,
+) -> Result<(), String> {
+    let mut store = state
+        .store
+        .lock()
+        .map_err(|_| "Impossible d’accéder aux données LUCY.".to_string())?;
+    let session = store
+        .sessions
+        .iter_mut()
+        .find(|session| session.id == session_id)
+        .ok_or_else(|| "La session a été supprimée pendant la génération.".to_string())?;
+    session.messages.push(message);
+    session.updated_at = now_millis();
+    save_store(state, &store)
+}
+
+fn emit_chat_error(app: &AppHandle, session_id: &str, message_id: &str, error: &str) {
+    let _ = app.emit(
+        CHAT_UPDATE,
+        ChatUpdate {
+            session_id: session_id.to_string(),
+            message_id: message_id.to_string(),
+            kind: "error".into(),
+            delta: String::new(),
+            error: Some(error.to_string()),
+            details: None,
+        },
+    );
+}
+
+#[tauri::command]
+fn set_project_mode(
+    state: State<'_, AppState>,
+    session_id: String,
+    mode: String,
+) -> Result<(), String> {
+    if !matches!(mode.as_str(), "build" | "plan" | "discussion") {
+        return Err("Mode de conversation inconnu.".into());
+    }
+    let mut store = state
+        .store
+        .lock()
+        .map_err(|_| "Impossible d’accéder aux données LUCY.".to_string())?;
+    let session = store
+        .sessions
+        .iter_mut()
+        .find(|session| session.id == session_id)
+        .ok_or_else(|| "La session n'existe plus.".to_string())?;
+    session.mode = mode;
+    save_store(&state, &store)
+}
+
+#[tauri::command]
+fn set_selected_model(
+    state: State<'_, AppState>,
+    provider_id: Option<String>,
+    model_id: Option<String>,
+) -> Result<PublicState, String> {
+    let mut store = state
+        .store
+        .lock()
+        .map_err(|_| "Impossible d’accéder aux données LUCY.".to_string())?;
+    match (&provider_id, &model_id) {
+        (Some(provider_id), Some(model_id)) => {
+            let provider = store
+                .providers
+                .iter()
+                .find(|provider| &provider.id == provider_id)
+                .ok_or_else(|| "Fournisseur inconnu.".to_string())?;
+            if !provider.models.iter().any(|model| model == model_id) {
+                return Err("Le modèle choisi n’existe pas dans ce fournisseur.".into());
+            }
+        }
+        (None, None) => {}
+        _ => return Err("Le fournisseur et le modèle doivent être sélectionnés ensemble.".into()),
+    }
+    store.selected_provider_id = provider_id;
+    store.selected_model_id = model_id;
+    save_store(&state, &store)?;
+    Ok(public_state(&store))
+}
+
+#[tauri::command]
+fn load_app_state(state: State<'_, AppState>) -> Result<PublicState, String> {
+    let store = state
+        .store
+        .lock()
+        .map_err(|_| "Impossible d’accéder aux données LUCY.".to_string())?;
+    Ok(public_state(&store))
+}
+
+#[tauri::command]
+fn set_project_path(
+    state: State<'_, AppState>,
+    project_path: String,
+) -> Result<PublicState, String> {
+    if !Path::new(&project_path).is_dir() {
+        return Err("Le dossier de projet sélectionné n'existe pas.".into());
+    }
+    let mut store = state
+        .store
+        .lock()
+        .map_err(|_| "Impossible d’accéder aux données LUCY.".to_string())?;
+    store.project_path = Some(project_path);
+    save_store(&state, &store)?;
+    Ok(public_state(&store))
+}
+
+#[tauri::command]
+async fn import_opencode_providers(state: State<'_, AppState>) -> Result<PublicState, String> {
+    let output = Command::new("opencode")
+        .args(["auth", "export"])
+        .output()
+        .map_err(|error| {
+            format!(
+                "Impossible d'importer les comptes existants : la commande `opencode auth export` n'est pas disponible ({error}). Tu peux utiliser une API compatible OpenAI ou Ollama directement."
+            )
+        })?;
+    if !output.status.success() {
+        return Err(format!(
+            "L'import OpenCode a échoué : {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let exported: Vec<serde_json::Value> =
+        serde_json::from_slice(&output.stdout).map_err(|error| {
+            format!("Le format d'export des comptes OpenCode est invalide : {error}")
+        })?;
+    let mut imported_providers = Vec::new();
+    for value in &exported {
+        let Some(mut provider) = imported_provider(value) else {
+            continue;
+        };
+        let client = Client::builder()
+            .timeout(Duration::from_secs(8))
+            .build()
+            .map_err(|error| format!("Impossible de vérifier un fournisseur importé : {error}"))?;
+        match provider_request(&client, &provider, "/models").send().await {
+            Ok(response) if response.status().is_success() => {
+                match response.json::<serde_json::Value>().await {
+                    Ok(body) => {
+                        provider.models = body["data"]
+                            .as_array()
+                            .map(|models| {
+                                models
+                                    .iter()
+                                    .filter_map(|model| model["id"].as_str().map(str::to_owned))
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        if provider.models.is_empty() {
+                            provider.models_error = Some(
+                                "Le fournisseur n’a renvoyé aucun modèle. Réessaie avec MODÈLES ↻."
+                                    .into(),
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        provider.models_error = Some(format!(
+                            "Réponse de catalogue invalide : {error}. Réessaie avec MODÈLES ↻."
+                        ));
+                    }
+                }
+            }
+            Ok(response) => {
+                let status = response.status();
+                let detail = response.text().await.unwrap_or_default();
+                if provider.id == "github-copilot"
+                    && provider
+                        .access_token_expires_at
+                        .is_some_and(|expires| expires <= now_millis())
+                {
+                    provider.api_key.clear();
+                    provider.models_error = Some(
+                        "Le jeton Copilot a expiré. Renouvelle la connexion dans OpenCode puis réimporte."
+                            .into(),
+                    );
+                } else {
+                    provider.models_error = Some(format!(
+                        "Catalogue indisponible (HTTP {status}) : {}. Réessaie avec MODÈLES ↻.",
+                        detail.chars().take(300).collect::<String>()
+                    ));
+                }
+            }
+            Err(error) => {
+                provider.models_error = Some(format!(
+                    "Catalogue inaccessible : {error}. Réessaie avec MODÈLES ↻."
+                ));
+            }
+        }
+        imported_providers.push(provider);
+    }
+    if imported_providers.is_empty() {
+        return Err(
+            "Aucun compte OpenAI-compatible importable n'a été trouvé. Les connexions OAuth Claude et autres fournisseurs propriétaires ne sont pas utilisables sans leur moteur natif ; tu peux ajouter une API compatible OpenAI ou Ollama."
+                .into(),
+        );
+    }
+    let mut store = state
+        .store
+        .lock()
+        .map_err(|_| "Impossible d’accéder aux données LUCY.".to_string())?;
+    for provider in imported_providers {
+        if let Some(existing) = store
+            .providers
+            .iter_mut()
+            .find(|item| item.id == provider.id)
+        {
+            *existing = provider;
+        } else {
+            store.providers.push(provider);
+        }
+        if store.selected_provider_id.is_none()
+            || !store.providers.iter().any(|provider| {
+                Some(&provider.id) == store.selected_provider_id.as_ref()
+                    && provider
+                        .models
+                        .iter()
+                        .any(|model| Some(model) == store.selected_model_id.as_ref())
+            })
+        {
+            let fallback_selection = store
+                .providers
+                .iter()
+                .find(|provider| !provider.models.is_empty())
+                .map(|provider| (provider.id.clone(), provider.models.first().cloned()));
+            if let Some((provider_id, model_id)) = fallback_selection {
+                store.selected_provider_id = Some(provider_id);
+                store.selected_model_id = model_id;
+            }
+        }
+    }
+    save_store(&state, &store)?;
+    Ok(public_state(&store))
+}
+
+#[tauri::command]
+fn save_provider(state: State<'_, AppState>, input: ProviderInput) -> Result<PublicState, String> {
+    let base_url = input.base_url.trim().trim_end_matches('/').to_string();
+    if !base_url.starts_with("https://")
+        && !base_url.starts_with("http://127.0.0.1")
+        && !base_url.starts_with("http://localhost")
+    {
+        return Err(
+            "L’URL du fournisseur doit utiliser HTTPS ; HTTP est réservé aux serveurs locaux."
+                .into(),
+        );
+    }
+    if input.id.trim().is_empty() || input.name.trim().is_empty() || base_url.is_empty() {
+        return Err("Le fournisseur, l’URL et son nom sont obligatoires.".into());
+    }
+    let mut store = state
+        .store
+        .lock()
+        .map_err(|_| "Impossible d’accéder aux données LUCY.".to_string())?;
+    let provider = StoredProvider {
+        id: input.id.trim().to_lowercase().replace(' ', "-"),
+        name: input.name.trim().to_string(),
+        base_url,
+        api_key: input.api_key.trim().to_string(),
+        models: input
+            .models
+            .into_iter()
+            .filter(|model| !model.trim().is_empty())
+            .collect(),
+        source: "manual".to_string(),
+        access_token_expires_at: None,
+        models_error: None,
+    };
+    if let Some(existing) = store
+        .providers
+        .iter_mut()
+        .find(|item| item.id == provider.id)
+    {
+        *existing = provider;
+    } else {
+        store.providers.push(provider);
+    }
+    save_store(&state, &store)?;
+    Ok(public_state(&store))
+}
+
+#[tauri::command]
+fn delete_provider(state: State<'_, AppState>, provider_id: String) -> Result<PublicState, String> {
+    let mut store = state
+        .store
+        .lock()
+        .map_err(|_| "Impossible d’accéder aux données LUCY.".to_string())?;
+    store
+        .providers
+        .retain(|provider| provider.id != provider_id);
+    if store.selected_provider_id.as_deref() == Some(&provider_id) {
+        store.selected_provider_id = None;
+        store.selected_model_id = None;
+    }
+    for session in &mut store.sessions {
+        if session.provider_id == provider_id {
+            session.provider_id.clear();
+            session.model_id.clear();
+        }
+    }
+    save_store(&state, &store)?;
+    Ok(public_state(&store))
+}
+
+#[tauri::command]
+async fn refresh_provider_models(
+    state: State<'_, AppState>,
+    provider_id: String,
+) -> Result<PublicState, String> {
+    let provider = {
+        let store = state
+            .store
+            .lock()
+            .map_err(|_| "Impossible d’accéder aux données LUCY.".to_string())?;
+        store
+            .providers
+            .iter()
+            .find(|provider| provider.id == provider_id)
+            .cloned()
+            .ok_or_else(|| "Fournisseur inconnu.".to_string())?
+    };
+    if provider.api_key.is_empty()
+        && !provider.base_url.starts_with("http://127.0.0.1")
+        && !provider.base_url.starts_with("http://localhost")
+    {
+        return Err(format!(
+            "Le compte {} a un jeton OAuth expiré. Reconnecte-le avec l’import ou ajoute une clé API.",
+            provider.name
+        ));
+    }
+    let client = Client::builder()
+        .timeout(Duration::from_secs(20))
+        .build()
+        .map_err(|error| format!("Impossible de préparer la connexion fournisseur : {error}"))?;
+    let response = match provider_request(&client, &provider, "/models").send().await {
+        Ok(response) => response,
+        Err(reason) => {
+            let error = format!(
+                "Impossible de récupérer les modèles de {} : {reason}",
+                provider.name
+            );
+            record_provider_models_error(&state, &provider_id, &error)?;
+            return Err(error);
+        }
+    };
+    if !response.status().is_success() {
+        let status = response.status();
+        let detail = response.text().await.unwrap_or_default();
+        let error = format!(
+            "Le fournisseur {} a refusé la requête (HTTP {status}) : {}",
+            provider.name,
+            detail.chars().take(500).collect::<String>()
+        );
+        record_provider_models_error(&state, &provider_id, &error)?;
+        return Err(error);
+    }
+    let body: serde_json::Value = match response.json().await {
+        Ok(body) => body,
+        Err(reason) => {
+            let error = format!("Réponse de modèle invalide de {} : {reason}", provider.name);
+            record_provider_models_error(&state, &provider_id, &error)?;
+            return Err(error);
+        }
+    };
+    let mut store = state
+        .store
+        .lock()
+        .map_err(|_| "Impossible d’accéder aux données LUCY.".to_string())?;
+    let stored = store
+        .providers
+        .iter_mut()
+        .find(|item| item.id == provider_id)
+        .ok_or_else(|| "Fournisseur supprimé pendant l'actualisation.".to_string())?;
+    let models: Vec<String> = body["data"]
+        .as_array()
+        .map(|models| {
+            models
+                .iter()
+                .filter_map(|model| model["id"].as_str().map(str::to_owned))
+                .collect::<Vec<String>>()
+        })
+        .unwrap_or_default();
+    stored.models = models.clone();
+    stored.models_error = if models.is_empty() {
+        Some(format!(
+            "Aucun modèle renvoyé par {}. Vérifie le compte ou la compatibilité de l’API.",
+            stored.name
+        ))
+    } else {
+        None
+    };
+    let fallback_model = models.first().cloned();
+    let selected_model_is_valid = store
+        .selected_model_id
+        .as_ref()
+        .is_some_and(|selected| models.contains(selected));
+    if let Some(model) = fallback_model {
+        if store.selected_provider_id.as_deref() == Some(&provider_id) && !selected_model_is_valid {
+            store.selected_model_id = Some(model);
+        }
+    }
+    save_store(&state, &store)?;
+    Ok(public_state(&store))
+}
+
+fn record_provider_models_error(
+    state: &AppState,
+    provider_id: &str,
+    error: &str,
+) -> Result<(), String> {
+    let mut store = state
+        .store
+        .lock()
+        .map_err(|_| "Impossible d’accéder aux données LUCY.".to_string())?;
+    if let Some(provider) = store
+        .providers
+        .iter_mut()
+        .find(|provider| provider.id == provider_id)
+    {
+        provider.models_error = Some(error.to_string());
+        save_store(state, &store)?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn create_chat_session(
+    state: State<'_, AppState>,
+    project_path: String,
+    provider_id: String,
+    model_id: String,
+) -> Result<ChatSession, String> {
+    if !Path::new(&project_path).is_dir() {
+        return Err("Sélectionne d'abord un dossier de projet valide.".into());
+    }
+    let now = now_millis();
+    let mut store = state
+        .store
+        .lock()
+        .map_err(|_| "Impossible d’accéder aux données LUCY.".to_string())?;
+    if !provider_id.is_empty()
+        && !store
+            .providers
+            .iter()
+            .any(|provider| provider.id == provider_id)
+    {
+        return Err("Sélectionne un fournisseur avant de créer une session.".into());
+    }
+    store.project_path = Some(project_path.clone());
+    let session = ChatSession {
+        id: format!("ses_{}", Uuid::new_v4().simple()),
+        title: "Nouvelle session".into(),
+        project_path,
+        provider_id,
+        model_id,
+        mode: default_mode(),
+        allow_all_tools: false,
+        messages: Vec::new(),
+        created_at: now,
+        updated_at: now,
+    };
+    store.sessions.insert(0, session.clone());
+    store.sessions.truncate(MAX_SESSIONS);
+    save_store(&state, &store)?;
+    Ok(session)
+}
+
+#[tauri::command]
+fn delete_chat_session(
+    state: State<'_, AppState>,
+    session_id: String,
+) -> Result<PublicState, String> {
+    let mut store = state
+        .store
+        .lock()
+        .map_err(|_| "Impossible d’accéder aux données LUCY.".to_string())?;
+    store.sessions.retain(|session| session.id != session_id);
+    save_store(&state, &store)?;
+    Ok(public_state(&store))
+}
+
+#[tauri::command]
+async fn send_message(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    session_id: String,
+    text: String,
+    provider_id: String,
+    model_id: String,
+    mode: String,
+) -> Result<(), String> {
+    let (cancel_sender, mut cancel) = watch::channel(false);
+    {
+        let mut active = state
+            .active_generations
+            .lock()
+            .map_err(|_| "Impossible d’accéder aux générations actives.".to_string())?;
+        if active.contains_key(&session_id) {
+            return Err("Une réponse est déjà en cours dans cette session.".into());
+        }
+        active.insert(session_id.clone(), cancel_sender);
+    }
+    let _generation_guard = ActiveGeneration {
+        state: &state,
+        session_id: session_id.clone(),
+    };
+    let text = text.trim().to_string();
+    if text.is_empty() {
+        return Err("Le message ne peut pas être vide.".into());
+    }
+    if !matches!(mode.as_str(), "build" | "plan" | "discussion") {
+        return Err("Mode de conversation inconnu.".into());
+    }
+    let (provider, session, user_message) = {
+        let mut store = state
+            .store
+            .lock()
+            .map_err(|_| "Impossible d’accéder aux données LUCY.".to_string())?;
+        let provider = store
+            .providers
+            .iter()
+            .find(|provider| provider.id == provider_id)
+            .cloned()
+            .ok_or_else(|| "Fournisseur supprimé. Actualise la liste des modèles.".to_string())?;
+        if provider.api_key.is_empty()
+            && !provider.base_url.starts_with("http://127.0.0.1")
+            && !provider.base_url.starts_with("http://localhost")
+        {
+            return Err(format!(
+                "Le jeton de {} a expiré. Reconnecte ce compte ou choisis un autre fournisseur.",
+                provider.name
+            ));
+        }
+        if !provider.models.iter().any(|model| model == &model_id) {
+            return Err("Actualise les modèles et sélectionne un modèle disponible.".into());
+        }
+        store.selected_provider_id = Some(provider_id.clone());
+        store.selected_model_id = Some(model_id.clone());
+        let session = store
+            .sessions
+            .iter_mut()
+            .find(|session| session.id == session_id)
+            .ok_or_else(|| "La session n'existe plus.".to_string())?;
+        session.provider_id = provider_id;
+        session.model_id = model_id.clone();
+        session.mode = mode.clone();
+        let user_message = ChatMessage {
+            id: Uuid::new_v4().to_string(),
+            role: "user".into(),
+            text,
+            created_at: now_millis(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            provider_metadata: Map::new(),
+        };
+        if session.title == "Nouvelle session" {
+            let title = user_message.text.lines().next().unwrap_or_default();
+            session.title = if title.chars().count() > 48 {
+                format!("{}…", title.chars().take(48).collect::<String>())
+            } else {
+                title.to_string()
+            };
+        }
+        session.messages.push(user_message.clone());
+        session.updated_at = now_millis();
+        let session_snapshot = session.clone();
+        save_store(&state, &store)?;
+        (provider, session_snapshot, user_message)
+    };
+    let _ = app.emit(
+        CHAT_UPDATE,
+        ChatUpdate {
+            session_id: session_id.clone(),
+            message_id: user_message.id,
+            kind: "user".into(),
+            delta: user_message.text,
+            error: None,
+            details: None,
+        },
+    );
+
+    let context = project_context(&session.project_path)?;
+    let _ = app.emit(
+        CHAT_UPDATE,
+        ChatUpdate {
+            session_id: session_id.clone(),
+            message_id: "context".into(),
+            kind: "context".into(),
+            delta: String::new(),
+            error: None,
+            details: Some(context.clone()),
+        },
+    );
+    let client = Client::builder()
+        .connect_timeout(Duration::from_secs(20))
+        .timeout(Duration::from_secs(300))
+        .build()
+        .map_err(|error| format!("Impossible de préparer la connexion au modèle : {error}"))?;
+    let mut chat_history = session.messages;
+    let mut final_answer = String::new();
+    for round in 0..=MAX_TOOL_ROUNDS {
+        let assistant_id = Uuid::new_v4().to_string();
+        let mode_instructions = match session.mode.as_str() {
+            "plan" => "MODE PLAN : inspecte et analyse le projet, propose un plan ordonné et les compromis. N’effectue aucune modification et n’exécute aucune commande.",
+            "discussion" => "MODE DISCUSSION : réponds aux questions et échange avec l’utilisateur sans utiliser d’outils ni modifier le projet.",
+            _ => "MODE BUILD : réalise la tâche demandée dans le projet, inspecte le contexte et utilise les outils appropriés. Les commandes et écritures exigent l’autorisation de l’utilisateur, sauf si l’autorisation de session est déjà activée.",
+        };
+        let mut chat_messages = vec![serde_json::json!({
+            "role": "system",
+            "content": format!(
+                "Tu es Lucy, un assistant de développement qui travaille dans le projet {}. {mode_instructions} La liste des fichiers pertinents est fournie ci-dessous ; utilise les outils read_file et list_files pour charger les fichiers nécessaires, plutôt que de prétendre avoir lu leur contenu. Toute commande shell ou écriture de fichier exige une confirmation explicite de l’utilisateur tant que l’autorisation de session n’est pas activée. Reste dans le dossier du projet, explique les erreurs d’outils et donne dans tes réponses une justification concise et vérifiable de tes décisions importantes, sans exposer de raisonnement interne privé.\n\nContexte du projet (arborescence et instructions locales) :\n{}",
+                session.project_path,
+                context["files"]
+                    .as_array()
+                    .map(|files| files.iter().filter_map(Value::as_str).collect::<Vec<_>>().join("\n"))
+                    .unwrap_or_default()
+                    + context["instructions"].as_str().unwrap_or_default()
+            ),
+        })];
+        chat_messages.extend(chat_history.iter().map(|message| {
+            let mut entry = serde_json::json!({
+                "role": message.role,
+                "content": message.text,
+            });
+            if !message.tool_calls.is_empty() {
+                entry["content"] = Value::Null;
+                entry["tool_calls"] = Value::Array(
+                    message
+                        .tool_calls
+                        .iter()
+                        .map(|stored_call| {
+                            let mut call = stored_call.clone();
+                            if let Some(function) = call["function"].as_object_mut() {
+                                if let Some(name) = function
+                                    .get("name")
+                                    .and_then(Value::as_str)
+                                    .map(str::to_owned)
+                                {
+                                    function.insert(
+                                        "name".into(),
+                                        Value::String(normalize_tool_name(&name)),
+                                    );
+                                }
+                                if let Some(arguments) = function
+                                    .get("arguments")
+                                    .and_then(Value::as_str)
+                                    .map(str::to_owned)
+                                {
+                                    function.insert(
+                                        "arguments".into(),
+                                        Value::String(normalize_tool_arguments(&arguments)),
+                                    );
+                                }
+                            }
+                            call
+                        })
+                        .collect(),
+                );
+            }
+            if let Some(tool_call_id) = &message.tool_call_id {
+                entry["tool_call_id"] = Value::String(tool_call_id.clone());
+            }
+            if let Some(metadata) = entry.as_object_mut() {
+                metadata.extend(message.provider_metadata.clone());
+            }
+            entry
+        }));
+        let url = format!(
+            "{}/chat/completions",
+            provider.base_url.trim_end_matches('/')
+        );
+        let mut payload = serde_json::json!({
+            "model": model_id,
+            "messages": chat_messages,
+            "stream": true,
+        });
+        let definitions = tool_definitions(&session.mode);
+        if round < MAX_TOOL_ROUNDS && session.mode != "discussion" {
+            payload["tools"] = definitions;
+            payload["tool_choice"] = Value::String("auto".into());
+        }
+        let mut retry_attempt = 0;
+        let response = loop {
+            let mut request = client
+                .post(&url)
+                .bearer_auth(&provider.api_key)
+                .header(header::ACCEPT, "text/event-stream")
+                .json(&payload);
+            if provider.id == "github-copilot" {
+                request = request
+                    .header("editor-version", "vscode/1.85.1")
+                    .header("editor-plugin-version", "copilot/1.155.0")
+                    .header("copilot-integration-id", "vscode-chat")
+                    .header("openai-intent", "conversation-panel")
+                    .header("user-agent", "GitHubCopilotChat/0.26.7");
+            }
+            let request_result = tokio::select! {
+                result = request.send() => result,
+                _ = cancel.changed() => {
+                    emit_chat_stopped(&app, &session_id);
+                    return Ok(());
+                }
+            };
+            match request_result {
+                Ok(response) if response.status().is_success() => {
+                    if retry_attempt > 0 {
+                        emit_retry_status(
+                            &app,
+                            &session_id,
+                            &assistant_id,
+                            retry_attempt,
+                            0,
+                            None,
+                            false,
+                        );
+                    }
+                    break response;
+                }
+                Ok(response) => {
+                    let status = response.status();
+                    let retry_after = response
+                        .headers()
+                        .get(header::RETRY_AFTER)
+                        .and_then(|value| value.to_str().ok())
+                        .and_then(|value| value.parse::<u64>().ok());
+                    let detail = tokio::select! {
+                        detail = response.text() => detail.unwrap_or_default(),
+                        _ = cancel.changed() => {
+                            emit_chat_stopped(&app, &session_id);
+                            return Ok(());
+                        }
+                    };
+                    if is_retryable_status(status) && retry_attempt < MAX_REQUEST_RETRIES {
+                        retry_attempt += 1;
+                        let delay = retry_delay_seconds(retry_attempt, retry_after);
+                        let reason = format!("HTTP {status}");
+                        emit_retry_status(
+                            &app,
+                            &session_id,
+                            &assistant_id,
+                            retry_attempt,
+                            delay,
+                            Some(&reason),
+                            true,
+                        );
+                        tokio::select! {
+                            _ = tokio::time::sleep(Duration::from_secs(delay)) => {},
+                            _ = cancel.changed() => {
+                                emit_chat_stopped(&app, &session_id);
+                                return Ok(());
+                            }
+                        }
+                        continue;
+                    }
+                    let error = format!(
+                        "{} a refusé la requête (HTTP {status}) : {}",
+                        provider.name,
+                        detail.chars().take(700).collect::<String>()
+                    );
+                    emit_chat_error(&app, &session_id, &assistant_id, &error);
+                    return Err(error);
+                }
+                Err(reason) => {
+                    if retry_attempt < MAX_REQUEST_RETRIES {
+                        retry_attempt += 1;
+                        let delay = retry_delay_seconds(retry_attempt, None);
+                        let retry_reason = format!("erreur réseau : {reason}");
+                        emit_retry_status(
+                            &app,
+                            &session_id,
+                            &assistant_id,
+                            retry_attempt,
+                            delay,
+                            Some(&retry_reason),
+                            true,
+                        );
+                        tokio::select! {
+                            _ = tokio::time::sleep(Duration::from_secs(delay)) => {},
+                            _ = cancel.changed() => {
+                                emit_chat_stopped(&app, &session_id);
+                                return Ok(());
+                            }
+                        }
+                        continue;
+                    }
+                    let error = format!("Impossible de contacter {} : {reason}", provider.name);
+                    emit_chat_error(&app, &session_id, &assistant_id, &error);
+                    return Err(error);
+                }
+            }
+        };
+        let mut stream = response.bytes_stream();
+        let mut buffer = String::new();
+        let mut answer = String::new();
+        let mut tool_calls: BTreeMap<usize, StreamedToolCall> = BTreeMap::new();
+        let mut provider_metadata = Map::new();
+        let mut stream_error = None;
+        'stream: loop {
+            let next_chunk = tokio::select! {
+                chunk = stream.next() => chunk,
+                _ = cancel.changed() => {
+                    if !answer.is_empty() {
+                        let partial = ChatMessage {
+                            id: assistant_id.clone(),
+                            role: "assistant".into(),
+                            text: answer,
+                            created_at: now_millis(),
+                            tool_calls: Vec::new(),
+                            tool_call_id: None,
+                            provider_metadata: provider_metadata.clone(),
+                        };
+                        chat_history.push(partial.clone());
+                        append_session_message(&state, &session_id, partial)?;
+                    }
+                    emit_chat_stopped(&app, &session_id);
+                    return Ok(());
+                }
+            };
+            let Some(chunk) = next_chunk else { break };
+            let chunk = match chunk {
+                Ok(chunk) => chunk,
+                Err(reason) => {
+                    stream_error = Some(format!(
+                        "Le flux de {} a été interrompu : {reason}",
+                        provider.name
+                    ));
+                    break;
+                }
+            };
+            buffer.push_str(&String::from_utf8_lossy(&chunk));
+            while let Some(newline) = buffer.find('\n') {
+                let line = buffer[..newline].trim_end_matches('\r').to_string();
+                buffer.drain(..=newline);
+                let Some(data) = line.strip_prefix("data:").map(str::trim) else {
+                    continue;
+                };
+                if data == "[DONE]" {
+                    break 'stream;
+                }
+                let payload: Value = match serde_json::from_str(data) {
+                    Ok(payload) => payload,
+                    Err(_) => continue,
+                };
+                if let Some(message) = payload["error"]["message"].as_str() {
+                    stream_error = Some(message.to_string());
+                    break 'stream;
+                }
+                let delta = &payload["choices"][0]["delta"];
+                merge_provider_metadata(&mut provider_metadata, delta);
+                if let Some(text_delta) = delta["content"].as_str() {
+                    answer.push_str(text_delta);
+                    let _ = app.emit(
+                        CHAT_UPDATE,
+                        ChatUpdate {
+                            session_id: session_id.clone(),
+                            message_id: assistant_id.clone(),
+                            kind: "delta".into(),
+                            delta: text_delta.to_string(),
+                            error: None,
+                            details: None,
+                        },
+                    );
+                }
+                if let Some(calls) = delta["tool_calls"].as_array() {
+                    for call in calls {
+                        let index = match streamed_tool_index(call, &tool_calls) {
+                            Ok(index) => index,
+                            Err(error) => {
+                                stream_error = Some(error);
+                                break 'stream;
+                            }
+                        };
+                        let tool = tool_calls.entry(index).or_insert_with(|| StreamedToolCall {
+                            id: String::new(),
+                            name: String::new(),
+                            arguments: String::new(),
+                            metadata: Map::new(),
+                        });
+                        merge_provider_metadata(&mut tool.metadata, call);
+                        for standard_field in ["index", "id", "type", "function"] {
+                            tool.metadata.remove(standard_field);
+                        }
+                        if let Some(id) = call["id"].as_str() {
+                            if tool.id.is_empty() {
+                                tool.id = id.to_string();
+                            }
+                        }
+                        if let Some(name) = call["function"]["name"].as_str() {
+                            merge_stream_fragment(&mut tool.name, name);
+                        }
+                        if let Some(arguments) = call["function"]["arguments"].as_str() {
+                            merge_stream_fragment(&mut tool.arguments, arguments);
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(error) = stream_error {
+            if !answer.is_empty() {
+                chat_history.push(ChatMessage {
+                    id: assistant_id.clone(),
+                    role: "assistant".into(),
+                    text: answer.clone(),
+                    created_at: now_millis(),
+                    tool_calls: Vec::new(),
+                    tool_call_id: None,
+                    provider_metadata: provider_metadata.clone(),
+                });
+                append_session_message(
+                    &state,
+                    &session_id,
+                    chat_history
+                        .last()
+                        .expect("the assistant message was just appended")
+                        .clone(),
+                )?;
+            }
+            emit_chat_error(&app, &session_id, &assistant_id, &error);
+            return Err(error);
+        }
+        if tool_calls.is_empty() {
+            if answer.is_empty() {
+                let error = format!(
+                    "Le modèle {} a terminé sans réponse. Vérifie l’identifiant du modèle et la compatibilité des outils sur ce fournisseur.",
+                    provider.name
+                );
+                emit_chat_error(&app, &session_id, &assistant_id, &error);
+                return Err(error);
+            }
+            let message = ChatMessage {
+                id: assistant_id.clone(),
+                role: "assistant".into(),
+                text: answer,
+                created_at: now_millis(),
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+                provider_metadata,
+            };
+            chat_history.push(message.clone());
+            append_session_message(&state, &session_id, message)?;
+            final_answer = assistant_id;
+            break;
+        }
+
+        let streamed_calls: Vec<StreamedToolCall> = tool_calls
+            .into_values()
+            .map(|mut call| {
+                call.name = normalize_tool_name(&call.name);
+                call.arguments = normalize_tool_arguments(&call.arguments);
+                call
+            })
+            .collect();
+        let calls: Vec<IncomingToolCall> = streamed_calls
+            .iter()
+            .map(|call| {
+                serde_json::from_value(serde_json::json!({
+                    "id": call.id,
+                    "function": { "name": call.name, "arguments": call.arguments },
+                }))
+                .map_err(|error| format!("L’appel d’outil du modèle est invalide : {error}"))
+            })
+            .collect::<Result<_, _>>()?;
+        for call in &calls {
+            match serde_json::from_str::<Value>(&call.function.arguments) {
+                Ok(arguments) if arguments.is_object() => {}
+                Ok(_) => {
+                    let error = format!(
+                        "Le fournisseur a généré des paramètres non valides pour {} : un objet JSON était attendu.",
+                        call.function.name
+                    );
+                    emit_chat_error(&app, &session_id, &assistant_id, &error);
+                    return Err(error);
+                }
+                Err(reason) => {
+                    let error = format!(
+                        "Le fournisseur a généré des paramètres JSON invalides pour {} : {reason}",
+                        call.function.name
+                    );
+                    emit_chat_error(&app, &session_id, &assistant_id, &error);
+                    return Err(error);
+                }
+            }
+        }
+        if round == MAX_TOOL_ROUNDS {
+            let error = format!(
+                "Le modèle a demandé d’autres outils après la limite de {MAX_TOOL_ROUNDS} tours."
+            );
+            emit_chat_error(&app, &session_id, &assistant_id, &error);
+            return Err(error);
+        }
+        let stored_calls: Vec<Value> = calls
+            .iter()
+            .zip(streamed_calls.iter())
+            .map(|(call, streamed)| {
+                let mut stored = serde_json::json!({
+                    "id": call.id,
+                    "type": "function",
+                    "function": { "name": call.function.name, "arguments": call.function.arguments },
+                });
+                if let Some(fields) = stored.as_object_mut() {
+                    fields.extend(streamed.metadata.clone());
+                }
+                stored
+            })
+            .collect();
+        let tool_message = ChatMessage {
+            id: assistant_id.clone(),
+            role: "assistant".into(),
+            text: answer,
+            created_at: now_millis(),
+            tool_calls: stored_calls,
+            tool_call_id: None,
+            provider_metadata,
+        };
+        chat_history.push(tool_message.clone());
+        append_session_message(&state, &session_id, tool_message)?;
+        let _ = app.emit(
+            CHAT_UPDATE,
+            ChatUpdate {
+                session_id: session_id.clone(),
+                message_id: assistant_id,
+                kind: "round".into(),
+                delta: String::new(),
+                error: None,
+                details: None,
+            },
+        );
+
+        for call in calls {
+            let _ = app.emit(
+                CHAT_UPDATE,
+                ChatUpdate {
+                    session_id: session_id.clone(),
+                    message_id: call.id.clone(),
+                    kind: "tool_start".into(),
+                    delta: String::new(),
+                    error: None,
+                    details: Some(serde_json::json!({
+                        "name": call.function.name,
+                        "arguments": serde_json::from_str::<Value>(&call.function.arguments)
+                            .unwrap_or_else(|_| serde_json::json!({ "invalidArguments": call.function.arguments })),
+                    })),
+                },
+            );
+            let forbidden_by_mode = match session.mode.as_str() {
+                "discussion" => true,
+                "plan" => matches!(call.function.name.as_str(), "run_shell" | "write_file"),
+                _ => false,
+            };
+            let tool_result = match if forbidden_by_mode {
+                Err(format!(
+                    "L’outil {} n’est pas autorisé en mode {}.",
+                    call.function.name, session.mode
+                ))
+            } else {
+                tokio::select! {
+                    result = execute_tool(
+                        &app,
+                        &state,
+                        &session_id,
+                        &session.project_path,
+                        &call,
+                        cancel.clone(),
+                    ) => result,
+                    _ = cancel.changed() => {
+                        discard_incomplete_tool_turn(&state, &session_id)?;
+                        emit_chat_stopped(&app, &session_id);
+                        return Ok(());
+                    }
+                }
+            } {
+                Ok(result) => result,
+                Err(error) => format!("Action impossible : {error}"),
+            };
+            if *cancel.borrow() {
+                discard_incomplete_tool_turn(&state, &session_id)?;
+                emit_chat_stopped(&app, &session_id);
+                return Ok(());
+            }
+            let _ = app.emit(
+                CHAT_UPDATE,
+                ChatUpdate {
+                    session_id: session_id.clone(),
+                    message_id: call.id.clone(),
+                    kind: "tool_result".into(),
+                    delta: String::new(),
+                    error: None,
+                    details: Some(serde_json::json!({ "result": tool_result })),
+                },
+            );
+            let tool_message = ChatMessage {
+                id: Uuid::new_v4().to_string(),
+                role: "tool".into(),
+                text: tool_result,
+                created_at: now_millis(),
+                tool_calls: Vec::new(),
+                tool_call_id: Some(call.id),
+                provider_metadata: Map::new(),
+            };
+            chat_history.push(tool_message.clone());
+            append_session_message(&state, &session_id, tool_message)?;
+        }
+    }
+    if final_answer.is_empty() {
+        let error = format!(
+            "L’agent a atteint sa limite de {MAX_TOOL_ROUNDS} tours d’outils pour cette requête."
+        );
+        emit_chat_error(&app, &session_id, "tool-limit", &error);
+        return Err(error);
+    }
+    let _ = app.emit(
+        CHAT_UPDATE,
+        ChatUpdate {
+            session_id,
+            message_id: final_answer,
+            kind: "done".into(),
+            delta: String::new(),
+            error: None,
+            details: None,
+        },
+    );
+    Ok(())
+}
+
+#[tauri::command]
+fn stop_generation(state: State<'_, AppState>, session_id: String) -> Result<(), String> {
+    let active = state
+        .active_generations
+        .lock()
+        .map_err(|_| "Impossible d’accéder aux générations actives.".to_string())?;
+    if let Some(sender) = active.get(&session_id) {
+        let _ = sender.send(true);
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn truncate_session_from_message(
+    state: State<'_, AppState>,
+    session_id: String,
+    message_id: String,
+) -> Result<PublicState, String> {
+    let mut store = state
+        .store
+        .lock()
+        .map_err(|_| "Impossible d’accéder aux données LUCY.".to_string())?;
+    let session = store
+        .sessions
+        .iter_mut()
+        .find(|session| session.id == session_id)
+        .ok_or_else(|| "La session n’existe plus.".to_string())?;
+    let index = session
+        .messages
+        .iter()
+        .position(|message| message.id == message_id && message.role == "user")
+        .ok_or_else(|| "Ce message n’existe plus.".to_string())?;
+    session.messages.truncate(index);
+    session.title = session
+        .messages
+        .iter()
+        .find(|message| message.role == "user")
+        .map(|message| {
+            let title = message.text.lines().next().unwrap_or_default();
+            if title.chars().count() > 48 {
+                format!("{}…", title.chars().take(48).collect::<String>())
+            } else {
+                title.to_string()
+            }
+        })
+        .unwrap_or_else(|| "Nouvelle session".into());
+    session.updated_at = now_millis();
+    save_store(&state, &store)?;
+    Ok(public_state(&store))
+}
+
+#[tauri::command]
+fn list_project_files(
+    project_path: String,
+    requested_path: Option<String>,
+) -> Result<Vec<serde_json::Value>, String> {
+    let project = PathBuf::from(&project_path)
+        .canonicalize()
+        .map_err(|error| format!("Dossier de projet introuvable : {error}"))?;
+    let path = validate_path(
+        &project_path,
+        requested_path.as_deref().unwrap_or(&project_path),
+    )?;
+    if !path.is_dir() {
+        return Err("Le chemin demandé n'est pas un dossier.".into());
+    }
+    let mut entries = Vec::new();
+    let directory =
+        fs::read_dir(&path).map_err(|error| format!("Impossible de lire ce dossier : {error}"))?;
+    for entry in directory {
+        let entry =
+            entry.map_err(|error| format!("Impossible de lire une entrée du dossier : {error}"))?;
+        let metadata = fs::symlink_metadata(entry.path())
+            .map_err(|error| format!("Impossible d’identifier un fichier : {error}"))?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let relative = entry
+            .path()
+            .strip_prefix(&project)
+            .map_err(|error| format!("Chemin de projet invalide : {error}"))?
+            .to_path_buf();
+        if metadata.file_type().is_symlink()
+            || ensure_non_sensitive_path(&relative).is_err()
+            || matches!(
+                name.as_str(),
+                ".git"
+                    | "node_modules"
+                    | "target"
+                    | "dist"
+                    | ".cache"
+                    | ".venv"
+                    | ".npm"
+                    | ".cargo"
+                    | ".rustup"
+                    | ".var"
+                    | ".docker"
+                    | ".vscode-server"
+                    | ".gradle"
+                    | ".m2"
+                    | "snap"
+            )
+        {
+            continue;
+        }
+        entries.push(serde_json::json!({
+            "name": name,
+            "path": entry.path().to_string_lossy(),
+            "type": if metadata.is_dir() { "directory" } else { "file" },
+        }));
+    }
+    entries.sort_by(|left, right| {
+        let left_directory = left["type"] == "directory";
+        let right_directory = right["type"] == "directory";
+        right_directory
+            .cmp(&left_directory)
+            .then_with(|| left["name"].as_str().cmp(&right["name"].as_str()))
+    });
+    Ok(entries)
+}
+
+#[tauri::command]
+fn read_project_file(project_path: String, requested_path: String) -> Result<String, String> {
+    let path = validate_path(&project_path, &requested_path)?;
+    let metadata = fs::metadata(&path)
+        .map_err(|error| format!("Impossible de lire les métadonnées du fichier : {error}"))?;
+    if !metadata.is_file() {
+        return Err("Le chemin demandé n'est pas un fichier.".into());
+    }
+    if metadata.len() > 1_000_000 {
+        return Err("Aperçu limité aux fichiers de 1 Mo ou moins.".into());
+    }
+    fs::read_to_string(&path)
+        .map_err(|error| format!("Impossible de lire ce fichier texte : {error}"))
+}
+
+#[tauri::command]
+async fn run_confirmed_command(project_path: String, command: String) -> Result<String, String> {
+    if !Path::new(&project_path).is_dir() {
+        return Err("Le dossier de travail n'existe plus.".into());
+    }
+    if command.trim().is_empty() {
+        return Err("Saisis une commande à exécuter.".into());
+    }
+    execute_shell(&project_path, &command).await
+}
+
+fn main() {
+    tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
+        .setup(|app| {
+            let storage_path = app.path().app_data_dir()?.join("lucy.json");
+            let store = read_store(&storage_path).map_err(std::io::Error::other)?;
+            app.manage(AppState {
+                store: Mutex::new(store),
+                storage_path,
+                pending_approvals: Mutex::new(BTreeMap::new()),
+                active_generations: Mutex::new(BTreeMap::new()),
+            });
+            Ok(())
+        })
+        .invoke_handler(tauri::generate_handler![
+            load_app_state,
+            set_selected_model,
+            set_project_mode,
+            set_project_path,
+            import_opencode_providers,
+            save_provider,
+            delete_provider,
+            refresh_provider_models,
+            create_chat_session,
+            delete_chat_session,
+            send_message,
+            stop_generation,
+            truncate_session_from_message,
+            resolve_tool_approval,
+            list_project_files,
+            read_project_file,
+            run_confirmed_command,
+        ])
+        .run(tauri::generate_context!())
+        .expect("Erreur au lancement de LUCY");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plan_mode_exposes_only_read_only_tools() {
+        let tools = tool_definitions("plan");
+        let names: Vec<&str> = tools
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|tool| tool["function"]["name"].as_str())
+            .collect();
+        assert_eq!(names, ["read_file", "list_files"]);
+    }
+
+    #[test]
+    fn build_mode_includes_mutating_tools() {
+        let tools = tool_definitions("build");
+        let names: Vec<&str> = tools
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|tool| tool["function"]["name"].as_str())
+            .collect();
+        assert!(names.contains(&"run_shell"));
+        assert!(names.contains(&"write_file"));
+        assert!(names.contains(&"read_file"));
+        assert!(names.contains(&"list_files"));
+    }
+
+    #[test]
+    fn secret_paths_are_blocked_but_example_env_is_allowed() {
+        assert!(ensure_non_sensitive_path(Path::new(".ssh/id_ed25519")).is_err());
+        assert!(ensure_non_sensitive_path(Path::new(".env")).is_err());
+        assert!(ensure_non_sensitive_path(Path::new(".env.local")).is_err());
+        assert!(ensure_non_sensitive_path(Path::new(".env.example")).is_ok());
+    }
+
+    #[test]
+    fn selected_model_survives_store_serialization() {
+        let store = LocalStore {
+            selected_provider_id: Some("ollama".into()),
+            selected_model_id: Some("qwen2.5-coder:14b".into()),
+            ..LocalStore::default()
+        };
+        let encoded = serde_json::to_vec(&store).unwrap();
+        let decoded: LocalStore = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded.selected_provider_id.as_deref(), Some("ollama"));
+        assert_eq!(
+            decoded.selected_model_id.as_deref(),
+            Some("qwen2.5-coder:14b")
+        );
+    }
+
+    #[test]
+    fn imports_supported_opencode_credentials_without_exposing_them() {
+        for (integration_id, credential_type, credential_field) in [
+            ("google", "key", "key"),
+            ("groq", "key", "key"),
+            ("github-copilot", "oauth", "access"),
+        ] {
+            let mut exported = serde_json::json!({
+                "integrationID": integration_id,
+                "value": {
+                    "type": credential_type,
+                    "expires": 4_000_000_000u64,
+                }
+            });
+            exported["value"][credential_field] = Value::String("test-secret".into());
+            let provider = imported_provider(&exported).unwrap();
+            assert_eq!(provider.id, integration_id);
+            assert_eq!(provider.api_key, "test-secret");
+            assert!(provider.models.is_empty());
+            assert_eq!(provider.models_error, None);
+        }
+    }
+
+    #[test]
+    fn assigns_stable_indices_when_streamed_tool_calls_omit_them() {
+        let mut calls = BTreeMap::new();
+        let first = serde_json::json!({
+            "id": "call-a",
+            "function": { "name": "read_file", "arguments": "" }
+        });
+        let first_index = streamed_tool_index(&first, &calls).unwrap();
+        assert_eq!(first_index, 0);
+        calls.insert(
+            first_index,
+            StreamedToolCall {
+                id: "call-a".into(),
+                name: "read_file".into(),
+                arguments: String::new(),
+                metadata: Map::new(),
+            },
+        );
+
+        let continuation = serde_json::json!({
+            "function": { "arguments": "{\"path\":\"README.md\"}" }
+        });
+        assert_eq!(streamed_tool_index(&continuation, &calls).unwrap(), 0);
+
+        let second = serde_json::json!({
+            "id": "call-b",
+            "function": { "name": "list_files", "arguments": "" }
+        });
+        let second_index = streamed_tool_index(&second, &calls).unwrap();
+        assert_eq!(second_index, 1);
+        calls.insert(
+            second_index,
+            StreamedToolCall {
+                id: "call-b".into(),
+                name: "list_files".into(),
+                arguments: String::new(),
+                metadata: Map::new(),
+            },
+        );
+
+        let ambiguous = serde_json::json!({
+            "function": { "arguments": "{}" }
+        });
+        assert_eq!(streamed_tool_index(&ambiguous, &calls).unwrap(), 1);
+    }
+
+    #[test]
+    fn merges_repeated_and_cumulative_tool_call_fragments_without_corrupting_json() {
+        let mut name = String::new();
+        merge_stream_fragment(&mut name, "write_file");
+        merge_stream_fragment(&mut name, "write_file");
+        merge_stream_fragment(&mut name, "write");
+        assert_eq!(name, "write_file");
+
+        let mut arguments = String::new();
+        merge_stream_fragment(&mut arguments, "{\"path\":\"src/main.rs\",");
+        merge_stream_fragment(
+            &mut arguments,
+            "{\"path\":\"src/main.rs\",\"content\":\"fn main() {}\"}",
+        );
+        merge_stream_fragment(
+            &mut arguments,
+            "{\"path\":\"src/main.rs\",\"content\":\"fn main() {}\"}",
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(&arguments).unwrap(),
+            serde_json::json!({ "path": "src/main.rs", "content": "fn main() {}" })
+        );
+
+        let mut incremental = String::new();
+        merge_stream_fragment(&mut incremental, "{\"path\":");
+        merge_stream_fragment(&mut incremental, "\"README.md\"}");
+        assert_eq!(
+            serde_json::from_str::<Value>(&incremental).unwrap(),
+            serde_json::json!({ "path": "README.md" })
+        );
+
+        assert_eq!(normalize_tool_name("write_filewrite_file"), "write_file");
+        let duplicated_arguments =
+            "{\"path\":\"src/main.rs\",\"content\":\"fn main() {}\"}{\"path\":\"src/main.rs\",\"content\":\"fn main() {}\"}";
+        assert_eq!(
+            serde_json::from_str::<Value>(&normalize_tool_arguments(duplicated_arguments)).unwrap(),
+            serde_json::json!({ "path": "src/main.rs", "content": "fn main() {}" })
+        );
+        assert_eq!(
+            normalize_tool_arguments("{\"path\":\"README.md\"}garbage"),
+            "{\"path\":\"README.md\"}garbage"
+        );
+    }
+
+    #[test]
+    fn preserves_google_thought_signatures_with_assistant_tool_calls() {
+        let mut metadata = Map::new();
+        merge_provider_metadata(
+            &mut metadata,
+            &serde_json::json!({
+                "extra_content": {
+                    "google": { "thought_signature": "signature-part" }
+                },
+                "tool_calls": [{ "id": "call-google" }]
+            }),
+        );
+        merge_provider_metadata(
+            &mut metadata,
+            &serde_json::json!({
+                "extra_content": {
+                    "google": { "other_metadata": "preserved" }
+                }
+            }),
+        );
+
+        let mut tool_metadata = Map::new();
+        merge_provider_metadata(
+            &mut tool_metadata,
+            &serde_json::json!({
+                "id": "call-google",
+                "index": 0,
+                "type": "function",
+                "function": { "name": "list_files", "arguments": "{}" },
+                "extra_content": {
+                    "google": { "thought_signature": "tool-signature" }
+                }
+            }),
+        );
+        for standard_field in ["index", "id", "type", "function"] {
+            tool_metadata.remove(standard_field);
+        }
+
+        let assistant_turn = serde_json::json!({
+            "role": "assistant",
+            "content": null,
+            "tool_calls": [{
+                "id": "call-google",
+                "type": "function",
+                "function": { "name": "list_files", "arguments": "{}" },
+                "extra_content": tool_metadata["extra_content"]
+            }],
+            "extra_content": metadata["extra_content"]
+        });
+        assert_eq!(
+            assistant_turn["tool_calls"][0]["extra_content"]["google"]["thought_signature"],
+            "tool-signature"
+        );
+        assert_eq!(
+            assistant_turn["extra_content"]["google"]["thought_signature"],
+            "signature-part"
+        );
+        assert_eq!(
+            assistant_turn["extra_content"]["google"]["other_metadata"],
+            "preserved"
+        );
+        assert!(metadata.get("tool_calls").is_none());
+    }
+
+    #[test]
+    fn retries_temporary_provider_failures_with_increasing_capped_delays() {
+        let delays: Vec<u64> = (1..=MAX_REQUEST_RETRIES)
+            .map(|attempt| retry_delay_seconds(attempt, None))
+            .collect();
+        assert_eq!(delays, vec![2, 4, 8, 16, 32, 64, 128, 256, 300, 300]);
+        assert_eq!(retry_delay_seconds(2, Some(12)), 12);
+        assert_eq!(retry_delay_seconds(3, Some(600)), MAX_RETRY_DELAY_SECONDS);
+
+        assert!(is_retryable_status(reqwest::StatusCode::TOO_MANY_REQUESTS));
+        assert!(is_retryable_status(
+            reqwest::StatusCode::SERVICE_UNAVAILABLE
+        ));
+        assert!(!is_retryable_status(reqwest::StatusCode::BAD_REQUEST));
+    }
+}
