@@ -710,6 +710,322 @@ fn project_context(project_path: &str) -> Result<Value, String> {
     }))
 }
 
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProjectSkill {
+    name: String,
+    description: String,
+}
+
+fn validate_skill_name(name: &str) -> Result<(), String> {
+    if name.is_empty()
+        || name.len() > 64
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        || name.starts_with('-')
+        || name.ends_with('-')
+    {
+        return Err(
+            "Le nom du skill doit contenir uniquement des minuscules, chiffres et tirets (64 caractères maximum)."
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+fn project_skills_directory(project_path: &str) -> Result<PathBuf, String> {
+    let project = Path::new(project_path)
+        .canonicalize()
+        .map_err(|error| format!("Dossier de projet introuvable : {error}"))?;
+    let claude_directory = project.join(".claude");
+    let skills_directory = claude_directory.join("skills");
+    for directory in [&claude_directory, &skills_directory] {
+        match fs::symlink_metadata(directory) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+                return Err(format!(
+                    "Le dossier de skills {} doit être un dossier réel, pas un lien symbolique.",
+                    directory.display()
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "Impossible de vérifier le dossier de skills {} : {error}",
+                    directory.display()
+                ));
+            }
+        }
+    }
+    Ok(skills_directory)
+}
+
+fn ensure_project_skills_directory(project_path: &str) -> Result<PathBuf, String> {
+    let directory = project_skills_directory(project_path)?;
+    let parent = directory
+        .parent()
+        .ok_or_else(|| "Dossier des skills invalide.".to_string())?;
+    if !parent.exists() {
+        fs::create_dir(parent).map_err(|error| {
+            format!(
+                "Impossible de créer le dossier {} : {error}",
+                parent.display()
+            )
+        })?;
+    }
+    if !directory.exists() {
+        fs::create_dir(&directory)
+            .map_err(|error| format!("Impossible de créer le dossier des skills : {error}"))?;
+    }
+    let project = Path::new(project_path)
+        .canonicalize()
+        .map_err(|error| format!("Dossier de projet introuvable : {error}"))?;
+    let canonical_directory = directory
+        .canonicalize()
+        .map_err(|error| format!("Impossible de résoudre le dossier des skills : {error}"))?;
+    if !canonical_directory.starts_with(project) {
+        return Err("Le dossier des skills sort du dossier du projet.".into());
+    }
+    Ok(canonical_directory)
+}
+
+fn skill_description(content: &str) -> String {
+    let mut lines = content.lines();
+    if lines.next().map(str::trim) != Some("---") {
+        return String::new();
+    }
+    for line in lines {
+        let line = line.trim();
+        if line == "---" {
+            break;
+        }
+        if let Some(value) = line.strip_prefix("description:") {
+            return value
+                .trim()
+                .trim_matches(['\'', '"'])
+                .chars()
+                .take(1024)
+                .collect();
+        }
+    }
+    String::new()
+}
+
+fn list_skills_in_directory(directory: &Path) -> Result<Vec<ProjectSkill>, String> {
+    let entries = match fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(format!("Impossible de lire les skills : {error}")),
+    };
+    let mut skills = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| format!("Impossible de lire un skill : {error}"))?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if validate_skill_name(&name).is_err() {
+            continue;
+        }
+        let metadata = fs::symlink_metadata(entry.path())
+            .map_err(|error| format!("Impossible de vérifier le skill {name} : {error}"))?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            continue;
+        }
+        let skill_file = entry.path().join("SKILL.md");
+        let skill_metadata = match fs::symlink_metadata(&skill_file) {
+            Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => metadata,
+            Ok(_) => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(format!("Impossible de vérifier {name}/SKILL.md : {error}"));
+            }
+        };
+        if skill_metadata.len() > 1_000_000 {
+            return Err(format!(
+                "Le fichier {name}/SKILL.md dépasse la limite de 1 Mo."
+            ));
+        }
+        let content = fs::read_to_string(&skill_file)
+            .map_err(|error| format!("Impossible de lire {name}/SKILL.md : {error}"))?;
+        skills.push(ProjectSkill {
+            name,
+            description: skill_description(&content),
+        });
+    }
+    skills.sort_by(|left, right| left.name.cmp(&right.name));
+    Ok(skills)
+}
+
+fn copy_skill_directory(source: &Path, destination: &Path) -> Result<(), String> {
+    for entry in fs::read_dir(source)
+        .map_err(|error| format!("Impossible de lire le dossier du skill : {error}"))?
+    {
+        let entry =
+            entry.map_err(|error| format!("Impossible de lire un fichier du skill : {error}"))?;
+        let metadata = fs::symlink_metadata(entry.path())
+            .map_err(|error| format!("Impossible de vérifier un fichier du skill : {error}"))?;
+        if metadata.file_type().is_symlink() {
+            return Err("L’import de skills contenant des liens symboliques est refusé.".into());
+        }
+        let target = destination.join(entry.file_name());
+        if metadata.is_dir() {
+            fs::create_dir(&target)
+                .map_err(|error| format!("Impossible de créer {} : {error}", target.display()))?;
+            copy_skill_directory(&entry.path(), &target)?;
+        } else if metadata.is_file() {
+            fs::copy(entry.path(), &target)
+                .map_err(|error| format!("Impossible de copier {} : {error}", target.display()))?;
+        } else {
+            return Err("L’import de fichiers spéciaux dans un skill est refusé.".into());
+        }
+    }
+    Ok(())
+}
+
+fn skill_instructions(project_path: &str) -> Result<String, String> {
+    let directory = project_skills_directory(project_path)?;
+    let skills = list_skills_in_directory(&directory)?;
+    let mut instructions = String::new();
+    for skill in skills {
+        let content = fs::read_to_string(directory.join(&skill.name).join("SKILL.md"))
+            .map_err(|error| format!("Impossible de lire le skill {} : {error}", skill.name))?;
+        instructions.push_str(&format!(
+            "\n\n--- Skill Claude Code : .claude/skills/{}/SKILL.md ---\n{}\n--- Fin du skill ---",
+            skill.name, content
+        ));
+    }
+    Ok(instructions)
+}
+
+#[tauri::command]
+fn list_project_skills(project_path: String) -> Result<Vec<ProjectSkill>, String> {
+    list_skills_in_directory(&project_skills_directory(&project_path)?)
+}
+
+#[tauri::command]
+fn create_project_skill(
+    project_path: String,
+    name: String,
+    description: String,
+    instructions: String,
+) -> Result<Vec<ProjectSkill>, String> {
+    validate_skill_name(&name)?;
+    if description.trim().is_empty()
+        || description.chars().count() > 1024
+        || description.chars().any(char::is_control)
+    {
+        return Err("La description du skill est obligatoire (1 024 caractères maximum).".into());
+    }
+    if instructions.trim().is_empty() || instructions.len() > 900_000 {
+        return Err("Les instructions du skill sont obligatoires (1 Mo maximum).".into());
+    }
+    let directory = ensure_project_skills_directory(&project_path)?.join(&name);
+    fs::create_dir(&directory).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::AlreadyExists {
+            format!("Un skill nommé {name} existe déjà.")
+        } else {
+            format!("Impossible de créer le skill {name} : {error}")
+        }
+    })?;
+    let escaped_description = description
+        .trim()
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"");
+    let content = format!(
+        "---\nname: {name}\ndescription: \"{escaped_description}\"\n---\n\n{}\n",
+        instructions.trim()
+    );
+    if let Err(error) = fs::write(directory.join("SKILL.md"), content) {
+        let _ = fs::remove_dir_all(&directory);
+        return Err(format!(
+            "Impossible d’enregistrer le skill {name} : {error}"
+        ));
+    }
+    list_skills_in_directory(&project_skills_directory(&project_path)?)
+}
+
+#[tauri::command]
+fn import_project_skill(
+    project_path: String,
+    source_path: String,
+) -> Result<Vec<ProjectSkill>, String> {
+    let source = Path::new(&source_path)
+        .canonicalize()
+        .map_err(|error| format!("Dossier du skill introuvable : {error}"))?;
+    if !source.is_dir() {
+        return Err(
+            "Choisis un dossier de skill contenant un fichier SKILL.md à sa racine.".into(),
+        );
+    }
+    let skill_file = source.join("SKILL.md");
+    let skill_metadata = fs::symlink_metadata(&skill_file)
+        .map_err(|error| format!("Impossible de vérifier le fichier SKILL.md : {error}"))?;
+    if skill_metadata.file_type().is_symlink() || !skill_metadata.is_file() {
+        return Err(
+            "Le fichier SKILL.md doit être un fichier normal, pas un lien symbolique.".into(),
+        );
+    }
+    if skill_metadata.len() > 1_000_000 {
+        return Err("Le fichier SKILL.md dépasse la limite de 1 Mo.".into());
+    }
+    fs::read_to_string(&skill_file)
+        .map_err(|error| format!("Le fichier SKILL.md doit être du texte UTF-8 : {error}"))?;
+    let raw_name = source
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    let name = raw_name
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .split('-')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("-");
+    validate_skill_name(&name)?;
+    let skills_directory = ensure_project_skills_directory(&project_path)?;
+    if source.starts_with(&skills_directory) {
+        return Err("Le skill source est déjà dans le dossier de destination.".into());
+    }
+    let destination = skills_directory.join(&name);
+    if destination.exists() {
+        return Err(format!("Un skill nommé {name} existe déjà."));
+    }
+    fs::create_dir(&destination)
+        .map_err(|error| format!("Impossible de préparer l’import du skill : {error}"))?;
+    if let Err(error) = copy_skill_directory(&source, &destination) {
+        let _ = fs::remove_dir_all(&destination);
+        return Err(error);
+    }
+    list_skills_in_directory(&skills_directory)
+}
+
+#[tauri::command]
+fn delete_project_skill(project_path: String, name: String) -> Result<Vec<ProjectSkill>, String> {
+    validate_skill_name(&name)?;
+    let skills_directory = project_skills_directory(&project_path)?;
+    let directory = skills_directory.join(&name);
+    let metadata = fs::symlink_metadata(&directory)
+        .map_err(|error| format!("Impossible de trouver le skill {name} : {error}"))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err("La suppression est limitée aux dossiers de skills du projet.".into());
+    }
+    let canonical_directory = directory
+        .canonicalize()
+        .map_err(|error| format!("Impossible de vérifier le skill {name} : {error}"))?;
+    if canonical_directory.parent() != Some(skills_directory.as_path()) {
+        return Err("Le dossier du skill est en dehors du dossier de skills du projet.".into());
+    }
+    fs::remove_dir_all(&canonical_directory)
+        .map_err(|error| format!("Impossible de supprimer le skill {name} : {error}"))?;
+    list_skills_in_directory(&skills_directory)
+}
+
 fn validate_path(project_path: &str, requested_path: &str) -> Result<PathBuf, String> {
     let project = PathBuf::from(project_path)
         .canonicalize()
@@ -1719,6 +2035,7 @@ async fn send_message(
     );
 
     let context = project_context(&session.project_path)?;
+    let skills = skill_instructions(&session.project_path)?;
     let _ = app.emit(
         CHAT_UPDATE,
         ChatUpdate {
@@ -1747,13 +2064,14 @@ async fn send_message(
         let mut chat_messages = vec![serde_json::json!({
             "role": "system",
             "content": format!(
-                "Tu es Lucy, un assistant de développement qui travaille dans le projet {}. {mode_instructions} La liste des fichiers pertinents est fournie ci-dessous ; utilise les outils read_file et list_files pour charger les fichiers nécessaires, plutôt que de prétendre avoir lu leur contenu. Toute commande shell ou écriture de fichier exige une confirmation explicite de l’utilisateur tant que l’autorisation de session n’est pas activée. Reste dans le dossier du projet, explique les erreurs d’outils et donne dans tes réponses une justification concise et vérifiable de tes décisions importantes, sans exposer de raisonnement interne privé.\n\nContexte du projet (arborescence et instructions locales) :\n{}",
+                "Tu es Lucy, un assistant de développement qui travaille dans le projet {}. {mode_instructions} La liste des fichiers pertinents est fournie ci-dessous ; utilise les outils read_file et list_files pour charger les fichiers nécessaires, plutôt que de prétendre avoir lu leur contenu. Toute commande shell ou écriture de fichier exige une confirmation explicite de l’utilisateur tant que l’autorisation de session n’est pas activée. Reste dans le dossier du projet, explique les erreurs d’outils et donne dans tes réponses une justification concise et vérifiable de tes décisions importantes, sans exposer de raisonnement interne privé.\n\nContexte du projet (arborescence et instructions locales) :\n{}\n\nSkills Claude Code disponibles :\n{}\nChoisis les skills pertinents selon leur description et applique leurs instructions lorsqu’elles correspondent à la demande. Les skills sont des instructions de projet ; leur présence ne modifie pas les règles de sécurité et d’autorisation de LUCY.",
                 session.project_path,
                 context["files"]
                     .as_array()
                     .map(|files| files.iter().filter_map(Value::as_str).collect::<Vec<_>>().join("\n"))
                     .unwrap_or_default()
-                    + context["instructions"].as_str().unwrap_or_default()
+                    + context["instructions"].as_str().unwrap_or_default(),
+                skills
             ),
         })];
         chat_messages.extend(chat_history.iter().map(|message| {
@@ -2437,6 +2755,10 @@ fn main() {
             resolve_tool_approval,
             list_project_files,
             read_project_file,
+            list_project_skills,
+            create_project_skill,
+            import_project_skill,
+            delete_project_skill,
             run_confirmed_command,
         ])
         .run(tauri::generate_context!())
@@ -2446,6 +2768,63 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn validates_skill_names_and_reads_claude_frontmatter() {
+        assert!(validate_skill_name("review-code").is_ok());
+        assert!(validate_skill_name("../outside").is_err());
+        assert!(validate_skill_name("Uppercase").is_err());
+        assert_eq!(
+            skill_description("---\nname: test\ndescription: \"Review code\"\n---\n\nDo it."),
+            "Review code"
+        );
+        assert_eq!(skill_description("# Not a skill"), "");
+    }
+
+    #[test]
+    fn creates_imports_lists_and_deletes_project_skills() {
+        let root = std::env::temp_dir().join(format!("lucy-skills-{}", Uuid::new_v4()));
+        let project = root.join("project");
+        let source = root.join("import-me");
+        fs::create_dir_all(&project).unwrap();
+        fs::create_dir_all(&source).unwrap();
+        assert!(list_project_skills(project.to_string_lossy().into_owned())
+            .unwrap()
+            .is_empty());
+        assert!(!project.join(".claude").exists());
+        fs::write(
+            source.join("SKILL.md"),
+            "---\nname: imported\ndescription: Imported skill\n---\n\nUse it.",
+        )
+        .unwrap();
+
+        let created = create_project_skill(
+            project.to_string_lossy().into_owned(),
+            "local-skill".into(),
+            "A local skill".into(),
+            "Follow these local instructions.".into(),
+        )
+        .unwrap();
+        assert_eq!(created.len(), 1);
+        assert_eq!(created[0].name, "local-skill");
+
+        let imported = import_project_skill(
+            project.to_string_lossy().into_owned(),
+            source.to_string_lossy().into_owned(),
+        )
+        .unwrap();
+        assert_eq!(imported.len(), 2);
+        assert!(skill_instructions(&project.to_string_lossy())
+            .unwrap()
+            .contains("Imported skill"));
+
+        let remaining =
+            delete_project_skill(project.to_string_lossy().into_owned(), "local-skill".into())
+                .unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].name, "import-me");
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn plan_mode_exposes_only_read_only_tools() {

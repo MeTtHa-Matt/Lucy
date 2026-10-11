@@ -255,6 +255,19 @@ button:disabled {
   color: #e4dde0;
 }
 
+.skills-button {
+  margin-top: 6px;
+  border-color: #392530;
+  color: #e899a7;
+}
+
+.skills-button small {
+  margin-left: auto;
+  color: #9f7782;
+  font-family: var(--mono);
+  font-size: 9px;
+}
+
 .sidebar-section-title {
   display: flex;
   justify-content: space-between;
@@ -1670,6 +1683,84 @@ details.tool-card summary {
   border: 1px solid #392830;
   background: rgba(12, 10, 13, 0.8);
   margin-top: 7px;
+}
+
+.skills-modal {
+  width: min(600px, calc(100vw - 60px));
+}
+
+.skills-list {
+  max-height: 190px;
+  overflow: auto;
+  margin: 10px 0;
+}
+
+.skill-card {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-top: 7px;
+  padding: 9px;
+  border: 1px solid #392830;
+  background: rgba(12, 10, 13, 0.8);
+}
+
+.skill-card > div {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.skill-card strong {
+  color: #eadfe4;
+  font-family: var(--mono);
+  font-size: 10px;
+}
+
+.skill-card small {
+  overflow: hidden;
+  color: #94868e;
+  font-size: 10px;
+  text-overflow: ellipsis;
+}
+
+.skill-card button {
+  width: 26px;
+  height: 25px;
+  flex: 0 0 auto;
+  border: 1px solid #51313b;
+  background: transparent;
+  color: #c5aab1;
+  font-size: 16px;
+}
+
+.skill-card button:hover {
+  border-color: #a42a43;
+  color: #ff8295;
+}
+
+.skills-modal .provider-form {
+  padding-top: 5px;
+}
+
+.skills-modal .skill-instructions {
+  width: 100%;
+  min-height: 130px;
+  padding: 9px 10px;
+  resize: vertical;
+  border: 1px solid #3e3138;
+  outline: none;
+  background: #0d0b0e;
+  color: #eee5e9;
+  font-family: var(--mono);
+  font-size: 10px;
+  line-height: 1.6;
+}
+
+.skills-modal .skill-instructions:focus {
+  border-color: #b4354d;
 }
 
 .provider-card > div:first-child {

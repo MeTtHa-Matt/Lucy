@@ -35,6 +35,7 @@ type StreamedEvent =
   | { kind: "tool_start"; tool: ToolActivity }
   | { kind: "tool_result"; id: string; result: string };
 type ProjectContext = { projectPath: string; files: string[]; instructions: string; truncated: boolean };
+type ProjectSkill = { name: string; description: string };
 type ToolApproval = {
   id: string;
   sessionId: string;
@@ -79,7 +80,9 @@ type FileItem = { name: string; path: string; type: "file" | "directory" };
 type MessageMenu = { messageId: string; text: string; selected: number };
 const localCommands = [
   { name: "help", description: "Afficher les commandes locales" },
-  { name: "clear", description: "Effacer l’affichage de la session" },
+  { name: "clear", description: "Effacer l’affichage sans supprimer l’historique" },
+  { name: "skill", description: "Gérer les skills Claude Code du projet" },
+  { name: "skills", description: "Gérer les skills Claude Code du projet" },
   { name: "terminal", description: "Ouvrir un terminal local avec confirmation" },
 ];
 
@@ -96,6 +99,7 @@ function App() {
   const [input, setInput] = useState("");
   const [draftMessage, setDraftMessage] = useState<ChatMessage | null>(null);
   const [draftAnswer, setDraftAnswer] = useState<ChatMessage | null>(null);
+  const [clearedChat, setClearedChat] = useState<{ sessionId: string; messageCount: number } | null>(null);
   const [busy, setBusy] = useState(false);
   const [messageMenu, setMessageMenu] = useState<MessageMenu | null>(null);
   const [editingMessageId, setEditingMessageId] = useState("");
@@ -111,6 +115,10 @@ function App() {
   const [filePath, setFilePath] = useState("");
   const [fileContent, setFileContent] = useState("");
   const [showProvider, setShowProvider] = useState(false);
+  const [showSkills, setShowSkills] = useState(false);
+  const [skills, setSkills] = useState<ProjectSkill[]>([]);
+  const [skillsBusy, setSkillsBusy] = useState(false);
+  const [skillForm, setSkillForm] = useState({ name: "", description: "", instructions: "" });
   const [providerForm, setProviderForm] = useState({
     id: "", name: "", baseUrl: "http://127.0.0.1:11434/v1", apiKey: "", models: "",
   });
@@ -448,6 +456,16 @@ function App() {
   }, [projectPath, syncFiles]);
 
   useEffect(() => {
+    if (!projectPath) {
+      setSkills([]);
+      return;
+    }
+    void invoke<ProjectSkill[]>("list_project_skills", { projectPath })
+      .then(setSkills)
+      .catch((reason: unknown) => setError(friendlyError(reason)));
+  }, [projectPath]);
+
+  useEffect(() => {
     const container = chatScroll.current;
     if (container && stickToChatBottom.current) {
       container.scrollTop = container.scrollHeight;
@@ -472,6 +490,80 @@ function App() {
     }
   };
 
+  const openSkillsManager = async () => {
+    if (!projectPath) {
+      setError("Choisis un projet avant de gérer ses skills Claude Code.");
+      return;
+    }
+    setShowSkills(true);
+    try {
+      setSkills(await invoke<ProjectSkill[]>("list_project_skills", { projectPath }));
+    } catch (reason) {
+      setError(friendlyError(reason));
+    }
+  };
+
+  const createSkill = async (event: React.FormEvent) => {
+    event.preventDefault();
+    if (!projectPath) return;
+    setSkillsBusy(true);
+    try {
+      const updated = await invoke<ProjectSkill[]>("create_project_skill", {
+        projectPath,
+        ...skillForm,
+      });
+      setSkills(updated);
+      setSkillForm({ name: "", description: "", instructions: "" });
+      setNotice("Skill Claude Code créé dans le projet.");
+      setError("");
+    } catch (reason) {
+      setError(friendlyError(reason));
+    } finally {
+      setSkillsBusy(false);
+    }
+  };
+
+  const importSkill = async () => {
+    if (!projectPath || !isTauri()) {
+      setError("L’import d’un skill nécessite l’application de bureau.");
+      return;
+    }
+    try {
+      const sourcePath = await open({
+        directory: true,
+        multiple: false,
+        title: "Choisir un dossier de skill Claude Code (avec SKILL.md)",
+      });
+      if (typeof sourcePath !== "string") return;
+      setSkillsBusy(true);
+      const updated = await invoke<ProjectSkill[]>("import_project_skill", {
+        projectPath,
+        sourcePath,
+      });
+      setSkills(updated);
+      setNotice("Skill importé dans .claude/skills.");
+      setError("");
+    } catch (reason) {
+      setError(friendlyError(reason));
+    } finally {
+      setSkillsBusy(false);
+    }
+  };
+
+  const deleteSkill = async (name: string) => {
+    if (!projectPath || !window.confirm(`Supprimer le skill « ${name} » de ce projet ?`)) return;
+    setSkillsBusy(true);
+    try {
+      setSkills(await invoke<ProjectSkill[]>("delete_project_skill", { projectPath, name }));
+      setNotice(`Skill « ${name} » supprimé du projet.`);
+      setError("");
+    } catch (reason) {
+      setError(friendlyError(reason));
+    } finally {
+      setSkillsBusy(false);
+    }
+  };
+
   const selectSession = (id: string) => {
     stickToChatBottom.current = true;
     streamedEvents.current = [];
@@ -479,6 +571,7 @@ function App() {
     streamComplete.current = false;
     setBusy(false);
     setSessionId(id);
+    setClearedChat(null);
     const selected = appState.sessions.find((session) => session.id === id);
     if (selected) {
       setProviderId(selected.providerId || appState.providers[0]?.id || "");
@@ -493,10 +586,10 @@ function App() {
     setError("");
   };
 
-  const createSession = async () => {
+  const createSession = async (): Promise<boolean> => {
     if (!projectPath) {
       setError("Le dossier de travail par défaut est introuvable.");
-      return;
+      return false;
     }
     try {
       const created = await invoke<Session>("create_chat_session", {
@@ -515,8 +608,10 @@ function App() {
       setContextLoading(false);
       setMode("build");
       await syncState();
+      return true;
     } catch (reason) {
       setError(friendlyError(reason));
+      return false;
     }
   };
 
@@ -637,17 +732,17 @@ function App() {
   const sendMessage = async (messageText?: string) => {
     const text = (messageText ?? input).trim();
     if (!text || busy || !sessionId) return;
-    if (!providerId || !modelId) {
-      setError("Connecte un fournisseur et sélectionne un modèle avant d’envoyer un message.");
-      setShowProvider(true);
-      return;
-    }
     setError("");
     setRetryStatus(null);
     setNotice("");
     if (text === "/help") {
-      setNotice("/help — aide ; /clear — effacer l’affichage ; /terminal — commande shell avec confirmation. L’agent répond par flux en direct.");
+      setNotice("/help — afficher l’aide ; /clear — effacer l’affichage sans supprimer l’historique ; /skill(s) — gérer les skills Claude Code ; /terminal — commande shell avec confirmation.");
       setInput("");
+      return;
+    }
+    if (text === "/skills" || text === "/skill") {
+      setInput("");
+      await openSkillsManager();
       return;
     }
     if (text === "/terminal") {
@@ -656,10 +751,21 @@ function App() {
       return;
     }
     if (text === "/clear") {
-      setDraftAnswer(null);
-      setDraftMessage(null);
-      setNotice("Historique conservé sur le disque. Sélectionne une nouvelle session pour repartir.");
       setInput("");
+      setDraftMessage(null);
+      setDraftAnswer(null);
+      setLiveTimeline([]);
+      setProjectContext(null);
+      setClearedChat({
+        sessionId,
+        messageCount: currentSession?.messages.length ?? 0,
+      });
+      setNotice("Affichage effacé. L’historique reste sauvegardé et visible si tu rouvres cette session.");
+      return;
+    }
+    if (!providerId || !modelId) {
+      setError("Connecte un fournisseur et sélectionne un modèle avant d’envoyer un message.");
+      setShowProvider(true);
       return;
     }
     const pendingUser: ChatMessage = {
@@ -873,7 +979,9 @@ function App() {
   };
 
   const messages = [
-    ...(currentSession?.messages ?? []),
+    ...((currentSession?.messages ?? []).slice(
+      clearedChat?.sessionId === sessionId ? clearedChat.messageCount : 0,
+    )),
     ...(draftMessage && !currentSession?.messages.some((message) => message.id === draftMessage.id) ? [draftMessage] : []),
     ...(draftAnswer && !currentSession?.messages.some((message) => message.id === draftAnswer.id) ? [draftAnswer] : []),
   ];
@@ -940,6 +1048,7 @@ function App() {
           </div>
           <button className="project-button" onClick={() => void chooseProject()}><span>⌘</span>{projectPath ? "CHANGER DE PROJET" : "OUVRIR UN PROJET"}</button>
           <button className="new-session" onClick={() => void createSession()}><span>＋</span> NOUVELLE SESSION</button>
+          <button className="new-session skills-button" onClick={() => void openSkillsManager()}><span>✳</span> SKILLS CLAUDE CODE <small>{skills.length}</small></button>
           <div className="sidebar-section-title"><span>CONVERSATIONS</span><span className="count">{visibleSessions.length.toString().padStart(2, "0")}</span></div>
           <label className="search-box"><span>⌕</span><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Filtrer les sessions…" /></label>
           <nav className="session-list">
@@ -1102,6 +1211,28 @@ function App() {
             <button className="approve-button provider-save" disabled={busy}>AJOUTER / ENREGISTRER LE FOURNISSEUR ↗</button>
           </form>
           <span className="modal-foot">CLÉS STOCKÉES EN LOCAL, FICHIER PROTÉGÉ EN 0600. CONNEXION DIRECTE AU FOURNISSEUR.</span>
+        </div>
+      </div>}
+
+      {showSkills && <div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) setShowSkills(false); }}>
+        <div className="modal-card skills-modal">
+          <div className="modal-kicker">CLAUDE CODE // SKILLS DU PROJET</div><button className="modal-close" onClick={() => setShowSkills(false)}>×</button><h2>Skills du projet.</h2>
+          <p>Les skills suivent le format Claude Code dans <code>.claude/skills/&lt;nom&gt;/SKILL.md</code>. LUCY charge leurs instructions pour chaque modèle connecté.</p>
+          <div className="skills-list">
+            {skills.map((skill) => <div className="skill-card" key={skill.name}>
+              <div><strong>{skill.name}</strong><small>{skill.description || "Aucune description"}</small></div>
+              <button className="remove-provider" aria-label={`Supprimer le skill ${skill.name}`} disabled={skillsBusy || busy} onClick={() => void deleteSkill(skill.name)}>×</button>
+            </div>)}
+            {skills.length === 0 && <p className="empty-side">Aucun skill dans ce projet. Crée-en un ou importe un dossier existant.</p>}
+          </div>
+          <button className="primary-button modal-submit" disabled={skillsBusy || busy} onClick={() => void importSkill()}>{skillsBusy ? "IMPORT EN COURS…" : "↥ IMPORTER UN DOSSIER DE SKILL"}</button>
+          <form onSubmit={(event) => void createSkill(event)} className="provider-form">
+            <label className="field-label">NOM DU SKILL (MINUSCULES ET TIRETS)</label><input value={skillForm.name} onChange={(event) => setSkillForm((form) => ({ ...form, name: event.target.value.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 64) }))} placeholder="revue-de-code" required />
+            <label className="field-label">DESCRIPTION</label><input value={skillForm.description} onChange={(event) => setSkillForm((form) => ({ ...form, description: event.target.value }))} placeholder="Quand utiliser ce skill et ce qu’il apporte" maxLength={1024} required />
+            <label className="field-label">INSTRUCTIONS</label><textarea className="skill-instructions" value={skillForm.instructions} onChange={(event) => setSkillForm((form) => ({ ...form, instructions: event.target.value }))} placeholder="Décris les consignes que le modèle doit suivre…" required />
+            <button className="approve-button provider-save" disabled={skillsBusy || busy}>CRÉER LE SKILL ↗</button>
+          </form>
+          <span className="modal-foot">CONTENU INJECTÉ DANS LE CONTEXTE SYSTÈME, QUEL QUE SOIT LE MODÈLE.</span>
         </div>
       </div>}
 
