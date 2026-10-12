@@ -47,9 +47,9 @@ fn opencode_executable() -> Result<PathBuf, String> {
         candidates.push(PathBuf::from(home).join(".opencode/bin/opencode.exe"));
     }
     if let Some(app_data) = env::var_os("APPDATA") {
-        candidates
-            .push(PathBuf::from(app_data).join("npm/node_modules/opencode-ai/bin/opencode.exe"));
-        candidates.push(PathBuf::from(app_data).join("npm/opencode.exe"));
+        let npm_dir = PathBuf::from(app_data).join("npm");
+        candidates.push(npm_dir.join("node_modules/opencode-ai/bin/opencode.exe"));
+        candidates.push(npm_dir.join("opencode.exe"));
     }
     if let Some(path) = env::var_os("PATH") {
         for directory in env::split_paths(&path) {
