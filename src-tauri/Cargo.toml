@@ -5,6 +5,9 @@ description = "LUCY — standalone AI coding desktop"
 authors = ["you"]
 edition = "2021"
 
+[profile.release]
+opt-level = 1
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
