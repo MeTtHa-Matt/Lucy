@@ -4,13 +4,13 @@ LUCY est une application de bureau locale pour discuter avec des modèles d’IA
 
 ## Installation
 
-L’installateur interactif vérifie les dépendances et propose leur installation avant de compiler LUCY. Sous Linux ou macOS, lance :
+L’installateur interactif vérifie les dépendances et propose leur installation avant de compiler LUCY. Il installe également le CLI OpenCode avec npm s’il manque, après confirmation. Sous Linux ou macOS, lance :
 
 ```sh
 bash scripts/install.sh
 ```
 
-Sous Windows, lance `scripts/install.bat` depuis l’Explorateur ou PowerShell. L’installateur utilise `winget` après confirmation pour les outils manquants. Sur Linux, il détecte la distribution, le gestionnaire de paquets et l’environnement de bureau, puis installe le binaire, le lanceur `lucy.desktop` dans le menu des applications et son icône. Les installateurs compilent dans un cache Cargo dédié au compte utilisateur, séparé de `src-tauri/target`, pour éviter les erreurs de cache après déplacement ou copie du projet.
+Sous Windows, lance `scripts/install.bat` depuis l’Explorateur ou PowerShell. L’installateur utilise `winget` après confirmation pour les outils manquants. Sur Linux, il détecte la distribution, le gestionnaire de paquets et l’environnement de bureau, puis installe le binaire, le lanceur `lucy.desktop` dans le menu des applications et son icône. Sur Linux et macOS, le CLI OpenCode est installé avec le préfixe `~/.local` et `~/.local/bin` est ajouté au PATH des nouveaux terminaux ; sous Windows, son dossier npm global est ajouté au PATH utilisateur. LUCY recherche également OpenCode dans ces emplacements lorsqu’elle le lance. Les installateurs compilent dans un cache Cargo dédié au compte utilisateur, séparé de `src-tauri/target`, pour éviter les erreurs de cache après déplacement ou copie du projet.
 
 Après la compilation, l’installateur demande le prénom ou surnom à utiliser dans les conversations. Il est conservé localement et n’est pas modifiable depuis l’application après l’installation. Si le projet est déjà compilé manuellement, les prérequis et commandes d’installation ci-dessous restent disponibles.
 
@@ -44,7 +44,7 @@ Au premier lancement, LUCY importe automatiquement les comptes OpenCode déjà p
 
 ## Fournisseurs et modèles
 
-Dans **Fournisseurs & modèles**, tu peux importer les identifiants OpenCode compatibles disponibles via `opencode auth export`, ou enregistrer une URL d’API compatible OpenAI et une clé. Les modèles gratuits Zen sont découverts automatiquement et ne nécessitent pas de clé API dans LUCY, mais le CLI OpenCode doit être installé et connecté localement. Pour Ollama, utilise généralement `http://127.0.0.1:11434/v1` et laisse la clé vide. Actualise ensuite la liste des modèles et sélectionne le modèle souhaité.
+Dans **Fournisseurs & modèles**, tu peux importer les identifiants OpenCode compatibles disponibles via `opencode auth export`, ou enregistrer une URL d’API compatible OpenAI et une clé. Les modèles gratuits Zen sont découverts automatiquement et ne nécessitent pas de clé API dans LUCY ; le CLI OpenCode installé localement doit aussi être connecté. Pour Ollama, utilise généralement `http://127.0.0.1:11434/v1` et laisse la clé vide. Actualise ensuite la liste des modèles et sélectionne le modèle souhaité.
 
 Les identifiants LUCY sont stockés dans son dossier de configuration local avec des permissions Unix `0600`. Les requêtes partent directement de LUCY vers l’URL configurée. Les comptes propriétaires qui ne fournissent pas une API compatible ne peuvent pas être importés ; le renouvellement automatique du jeton OAuth GitHub Copilot n’est pas pris en charge.
 

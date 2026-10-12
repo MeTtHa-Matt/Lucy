@@ -93,6 +93,31 @@ if ($Missing.Count -gt 0) {
 if (-not (Get-Command npm -ErrorAction SilentlyContinue)) {
     throw "npm est toujours introuvable après l’installation. Ferme et rouvre PowerShell, puis relance scripts/install.ps1."
 }
+if (-not (Get-Command opencode -ErrorAction SilentlyContinue)) {
+    Show-Frame "02  /  OPENCODE MANQUANT" "Installation du CLI avec npm"
+    if (-not (Ask-Install "OpenCode est requis pour les modèles OpenCode Zen.")) {
+        throw "OpenCode est requis pour utiliser les modèles OpenCode Zen dans LUCY."
+    }
+
+    & npm install --global opencode-ai
+    if ($LASTEXITCODE -ne 0) { throw "L’installation du CLI OpenCode a échoué (code $LASTEXITCODE)." }
+
+    $OpenCodeBin = (& npm config get prefix).Trim()
+    if (-not $OpenCodeBin) { throw "Impossible de déterminer le dossier d’installation global de npm." }
+    if (($env:Path -split ';') -notcontains $OpenCodeBin) {
+        $env:Path = "$OpenCodeBin;$env:Path"
+    }
+    $UserPath = [Environment]::GetEnvironmentVariable("Path", "User")
+    $UserPathEntries = @($UserPath -split ';' | Where-Object { $_ })
+    if ($UserPathEntries -notcontains $OpenCodeBin) {
+        [Environment]::SetEnvironmentVariable("Path", (($UserPathEntries + $OpenCodeBin) -join ';'), "User")
+    }
+    if (-not (Get-Command opencode -ErrorAction SilentlyContinue)) {
+        throw "OpenCode a été installé, mais la commande opencode reste introuvable dans PATH."
+    }
+} else {
+    Show-Frame "02  /  OPENCODE" "CLI déjà installé"
+}
 if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
     throw "cargo est toujours introuvable après l’installation. Ferme et rouvre PowerShell, puis relance scripts/install.ps1."
 }

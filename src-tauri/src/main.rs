@@ -1,5 +1,7 @@
 use std::{
     collections::BTreeMap,
+    env,
+    ffi::OsString,
     fs::{self, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
@@ -35,6 +37,23 @@ const CONTEXT_COMPACTION_THRESHOLD_TOKENS: usize = 24_000;
 const CONTEXT_COMPACTION_KEEP_TOKENS: usize = 8_000;
 const CONTEXT_SUMMARY_MAX_TOKENS: u64 = 1_200;
 const DEFAULT_PROJECT_PATH: &str = "/home/Matthew";
+
+fn opencode_command_path() -> Result<OsString, String> {
+    let mut paths = Vec::new();
+    #[cfg(windows)]
+    if let Some(app_data) = env::var_os("APPDATA") {
+        paths.push(PathBuf::from(app_data).join("npm"));
+    }
+    #[cfg(not(windows))]
+    if let Some(home) = env::var_os("HOME") {
+        paths.push(PathBuf::from(home).join(".local/bin"));
+    }
+    if let Some(path) = env::var_os("PATH") {
+        paths.extend(env::split_paths(&path));
+    }
+    env::join_paths(paths)
+        .map_err(|error| format!("Impossible de préparer le PATH d’OpenCode : {error}"))
+}
 
 fn default_mode() -> String {
     "build".into()
@@ -2171,6 +2190,7 @@ async fn run_opencode_model(
     let agent = opencode_agent_for_mode(&session.mode);
     let mut command = TokioCommand::new("opencode");
     command
+        .env("PATH", opencode_command_path()?)
         .args([
             "run", "--agent", agent, "--model", &model, "--format", "json",
         ])
@@ -2422,6 +2442,7 @@ fn set_project_path(
 #[tauri::command]
 async fn import_opencode_providers(state: State<'_, AppState>) -> Result<PublicState, String> {
     let output = Command::new("opencode")
+        .env("PATH", opencode_command_path()?)
         .args(["auth", "export"])
         .output()
         .map_err(|error| {

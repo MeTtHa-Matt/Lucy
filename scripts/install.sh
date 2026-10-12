@@ -43,7 +43,7 @@ fail() {
 
 has_command() { command -v "$1" >/dev/null 2>&1; }
 
-configure_linux_command_path() {
+configure_user_local_bin_path() {
   local shell_name="${SHELL##*/}" config line
   local -a configs=()
 
@@ -73,6 +73,23 @@ configure_linux_command_path() {
     mkdir -p "$(dirname "$config")" || fail "Impossible de préparer la configuration du shell : $config"
     printf '\n%s\n' "$line" >> "$config" || fail "Impossible d’ajouter ~/.local/bin au PATH dans $config."
   done
+}
+
+install_opencode_cli() {
+  if has_command opencode; then
+    step "02  /  OPENCODE" "CLI déjà installé" "Aucune installation supplémentaire nécessaire"
+    return
+  fi
+
+  if ! ask_yes_no "OpenCode manque. L’installer avec npm dans ~/.local ?"; then
+    fail "OpenCode est requis pour utiliser les modèles OpenCode Zen dans LUCY."
+  fi
+
+  npm install --global --prefix "$HOME/.local" opencode-ai \
+    || fail "L’installation du CLI OpenCode a échoué."
+  export PATH="$HOME/.local/bin:$PATH"
+  configure_user_local_bin_path
+  has_command opencode || fail "OpenCode a été installé, mais la commande opencode reste introuvable dans PATH."
 }
 
 install_linux_desktop_entry() {
@@ -261,6 +278,8 @@ if ! has_command node || ! has_command npm || ! has_command cargo; then
   fail "Dépendance manquante après installation : node, npm et cargo doivent être accessibles dans PATH."
 fi
 
+install_opencode_cli
+
 CARGO_TARGET_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/lucy/installer-cargo-target"
 export CARGO_TARGET_DIR
 mkdir -p "$CARGO_TARGET_DIR" || fail "Impossible de créer le cache de compilation Rust : $CARGO_TARGET_DIR"
@@ -301,7 +320,7 @@ if [[ "$(uname -s)" == "Darwin" ]]; then
 else
   npm run tauri -- build --no-bundle || fail "La compilation Linux a échoué."
   install -Dm755 "$CARGO_TARGET_DIR/release/lucy" "$HOME/.local/bin/lucy" || fail "Impossible d’installer LUCY dans ~/.local/bin."
-  configure_linux_command_path
+  configure_user_local_bin_path
   install_linux_desktop_entry
   install -Dm644 "$ROOT/src-tauri/icons/icon.png" \
     "${XDG_DATA_HOME:-$HOME/.local/share}/icons/hicolor/256x256/apps/lucy.png" \
