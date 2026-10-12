@@ -1,3 +1,5 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 use std::{
     collections::BTreeMap,
     env,
@@ -38,6 +40,36 @@ const CONTEXT_COMPACTION_KEEP_TOKENS: usize = 8_000;
 const CONTEXT_SUMMARY_MAX_TOKENS: u64 = 1_200;
 const DEFAULT_PROJECT_PATH: &str = "/home/Matthew";
 
+#[cfg(windows)]
+fn opencode_executable() -> Result<PathBuf, String> {
+    let mut candidates = Vec::new();
+    if let Some(home) = env::var_os("USERPROFILE") {
+        candidates.push(PathBuf::from(home).join(".opencode/bin/opencode.exe"));
+    }
+    if let Some(app_data) = env::var_os("APPDATA") {
+        candidates
+            .push(PathBuf::from(app_data).join("npm/node_modules/opencode-ai/bin/opencode.exe"));
+        candidates.push(PathBuf::from(app_data).join("npm/opencode.exe"));
+    }
+    if let Some(path) = env::var_os("PATH") {
+        for directory in env::split_paths(&path) {
+            candidates.push(directory.join("opencode.exe"));
+            candidates.push(directory.join("node_modules/opencode-ai/bin/opencode.exe"));
+        }
+    }
+    candidates
+        .into_iter()
+        .find(|candidate| candidate.is_file())
+        .ok_or_else(|| {
+            "Impossible de trouver l’exécutable OpenCode (`opencode.exe`). Vérifie son installation, puis redémarre LUCY.".into()
+        })
+}
+
+#[cfg(not(windows))]
+fn opencode_executable() -> Result<PathBuf, String> {
+    Ok(PathBuf::from("opencode"))
+}
+
 fn opencode_command_path() -> Result<OsString, String> {
     let mut paths = Vec::new();
     #[cfg(windows)]
@@ -53,6 +85,18 @@ fn opencode_command_path() -> Result<OsString, String> {
     }
     env::join_paths(paths)
         .map_err(|error| format!("Impossible de préparer le PATH d’OpenCode : {error}"))
+}
+
+#[cfg(windows)]
+fn hide_console_window(command: &mut Command) {
+    use std::os::windows::process::CommandExt;
+    command.creation_flags(0x08000000);
+}
+
+#[cfg(windows)]
+fn hide_tokio_console_window(command: &mut TokioCommand) {
+    use std::os::windows::process::CommandExt;
+    command.as_std_mut().creation_flags(0x08000000);
 }
 
 fn default_mode() -> String {
@@ -2188,13 +2232,15 @@ async fn run_opencode_model(
 > {
     let model = format!("opencode/{model_id}");
     let agent = opencode_agent_for_mode(&session.mode);
-    let mut command = TokioCommand::new("opencode");
+    let mut command = TokioCommand::new(opencode_executable()?);
     command
         .env("PATH", opencode_command_path()?)
         .args([
             "run", "--agent", agent, "--model", &model, "--format", "json",
         ])
         .current_dir(&session.project_path);
+    #[cfg(windows)]
+    hide_tokio_console_window(&mut command);
     if let Some(opencode_session_id) = session.opencode_session_id.as_deref() {
         command.args(["--session", opencode_session_id]);
     } else {
@@ -2441,15 +2487,17 @@ fn set_project_path(
 
 #[tauri::command]
 async fn import_opencode_providers(state: State<'_, AppState>) -> Result<PublicState, String> {
-    let output = Command::new("opencode")
+    let mut command = Command::new(opencode_executable()?);
+    command
         .env("PATH", opencode_command_path()?)
-        .args(["auth", "export"])
-        .output()
-        .map_err(|error| {
-            format!(
-                "Impossible d'importer les comptes existants : la commande `opencode auth export` n'est pas disponible ({error}). Tu peux utiliser une API compatible OpenAI ou Ollama directement."
-            )
-        })?;
+        .args(["auth", "export"]);
+    #[cfg(windows)]
+    hide_console_window(&mut command);
+    let output = command.output().map_err(|error| {
+        format!(
+            "Impossible d'importer les comptes existants avec `opencode auth export` : {error}. Tu peux utiliser une API compatible OpenAI ou Ollama directement."
+        )
+    })?;
     if !output.status.success() {
         return Err(format!(
             "L'import OpenCode a échoué : {}",

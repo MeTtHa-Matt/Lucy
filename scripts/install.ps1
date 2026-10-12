@@ -131,37 +131,44 @@ if (-not (Test-Path $VsDevCmd)) { throw "VsDevCmd.bat introuvable dans l’insta
 $CargoTargetDir = Join-Path $env:LOCALAPPDATA "Lucy\installer-cargo-target"
 New-Item -ItemType Directory -Path $CargoTargetDir -Force | Out-Null
 $env:CARGO_TARGET_DIR = $CargoTargetDir
-$InstallDir = Join-Path $env:LOCALAPPDATA "Programs\Lucy"
-$InstallExe = Join-Path $InstallDir "lucy.exe"
-$InstallMode = if (Test-Path $InstallExe) { "MISE À JOUR" } else { "INSTALLATION" }
+$DesktopShortcut = Join-Path ([Environment]::GetFolderPath("Desktop")) "LUCY.lnk"
+$InstallMode = if (Test-Path $DesktopShortcut) { "MISE À JOUR" } else { "INSTALLATION" }
 
 Show-Frame "03  /  $InstallMode" "Compilation de LUCY pour Windows"
 Push-Location $Root
 try {
-    $BuildCommand = 'call "{0}" -arch=x64 && cd /d "{1}" && npm ci && npm run tauri -- build --no-bundle' -f $VsDevCmd, $Root
+    $BuildCommand = 'call "{0}" -arch=x64 && cd /d "{1}" && npm ci && npm run tauri -- build --bundles nsis' -f $VsDevCmd, $Root
     & cmd.exe /d /s /c $BuildCommand
     if ($LASTEXITCODE -ne 0) { throw "La compilation de LUCY a échoué (code $LASTEXITCODE)." }
 } finally {
     Pop-Location
 }
 
-$Exe = Join-Path $CargoTargetDir "release\lucy.exe"
-if (-not (Test-Path $Exe)) { throw "La compilation est terminée mais lucy.exe est introuvable." }
-if (Test-Path $InstallExe) {
-    $RunningLucy = Get-Process -Name "lucy" -ErrorAction SilentlyContinue | Where-Object {
-        try { $_.Path -eq $InstallExe } catch { $false }
-    }
-    if ($RunningLucy) {
-        Show-Frame "04  /  FERMER LUCY" "LUCY doit être fermée pour appliquer la mise à jour"
-        Read-Host "  Ferme LUCY, puis appuie sur Entrée"
-        $StillRunning = Get-Process -Name "lucy" -ErrorAction SilentlyContinue | Where-Object {
-            try { $_.Path -eq $InstallExe } catch { $false }
-        }
-        if ($StillRunning) { throw "LUCY est encore ouverte. Ferme-la puis relance l’installateur." }
+$RunningLucy = Get-Process -Name "lucy" -ErrorAction SilentlyContinue
+if ($RunningLucy) {
+    Show-Frame "04  /  FERMER LUCY" "LUCY doit être fermée pour appliquer l’installation"
+    Read-Host "  Ferme LUCY, puis appuie sur Entrée"
+    if (Get-Process -Name "lucy" -ErrorAction SilentlyContinue) {
+        throw "LUCY est encore ouverte. Ferme-la puis relance l’installateur."
     }
 }
-New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
-Copy-Item $Exe $InstallExe -Force
+
+$NsisDir = Join-Path $CargoTargetDir "release\bundle\nsis"
+$Installer = Get-ChildItem -Path $NsisDir -Filter "*-setup.exe" -File -ErrorAction SilentlyContinue |
+    Sort-Object LastWriteTime -Descending |
+    Select-Object -First 1
+if (-not $Installer) { throw "Le paquet d’installation NSIS est introuvable dans $NsisDir." }
+
+Show-Frame "04  /  INSTALLATION WINDOWS" "Lancement de l’installateur LUCY"
+$InstallerProcess = Start-Process -FilePath $Installer.FullName -Wait -PassThru
+if ($InstallerProcess.ExitCode -ne 0) {
+    throw "L’installateur Windows a échoué (code $($InstallerProcess.ExitCode))."
+}
+$Shortcut = New-Object -ComObject WScript.Shell
+$ShortcutTarget = $Shortcut.CreateShortcut($DesktopShortcut).TargetPath
+if (-not $ShortcutTarget -or -not (Test-Path $ShortcutTarget)) {
+    throw "L’installation est terminée mais le raccourci de LUCY est introuvable sur le Bureau."
+}
 
 $DataDir = Join-Path $env:APPDATA "com.lucy.neural"
 $StorePath = Join-Path $DataDir "lucy.json"
@@ -193,7 +200,8 @@ if (-not $SavedName) {
 }
 
 Show-Frame "05  /  TERMINÉ" "LUCY · $InstallMode terminée"
-Write-Host "  Exécutable : $InstallDir\lucy.exe" -ForegroundColor $Green
+Write-Host "  Application installée : $ShortcutTarget" -ForegroundColor $Green
+Write-Host "  Raccourcis créés dans le menu Démarrer et sur le Bureau." -ForegroundColor $Green
 Write-Host "  Salut $UserName — ton prénom est enregistré localement." -ForegroundColor $Dim
 Write-Host ""
 Read-Host "  Entrée pour fermer"
