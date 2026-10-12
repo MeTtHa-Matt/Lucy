@@ -87,6 +87,64 @@ fn opencode_command_path() -> Result<OsString, String> {
         .map_err(|error| format!("Impossible de préparer le PATH d’OpenCode : {error}"))
 }
 
+fn opencode_auth_file_paths() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    if let Some(data_home) = env::var_os("XDG_DATA_HOME") {
+        paths.push(PathBuf::from(data_home).join("opencode/auth.json"));
+    }
+    if let Some(home) = env::var_os("HOME").or_else(|| env::var_os("USERPROFILE")) {
+        paths.push(PathBuf::from(&home).join(".local/share/opencode/auth.json"));
+        #[cfg(windows)]
+        paths.push(PathBuf::from(home).join("AppData/Roaming/opencode/auth.json"));
+    }
+    #[cfg(windows)]
+    if let Some(app_data) = env::var_os("APPDATA") {
+        paths.push(PathBuf::from(app_data).join("opencode/auth.json"));
+    }
+    paths
+}
+
+fn parse_opencode_auth_credentials(contents: &str) -> Result<Vec<Value>, String> {
+    let value: Value = serde_json::from_str(contents)
+        .map_err(|error| format!("Format JSON des identifiants OpenCode invalide : {error}"))?;
+    match value {
+        Value::Array(credentials) => Ok(credentials),
+        Value::Object(providers) => Ok(providers
+            .into_iter()
+            .map(|(integration_id, value)| {
+                serde_json::json!({
+                    "integrationID": integration_id,
+                    "value": value,
+                })
+            })
+            .collect()),
+        _ => Err("Le format du fichier d’identifiants OpenCode est inconnu.".into()),
+    }
+}
+
+fn read_opencode_auth_file() -> Result<Option<Vec<Value>>, String> {
+    for path in opencode_auth_file_paths() {
+        let contents = match fs::read_to_string(&path) {
+            Ok(contents) => contents,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(format!(
+                    "Impossible de lire les identifiants OpenCode dans {} : {error}",
+                    path.display()
+                ));
+            }
+        };
+        let credentials = parse_opencode_auth_credentials(&contents).map_err(|error| {
+            format!(
+                "Fichier d’identifiants OpenCode {} invalide : {error}",
+                path.display()
+            )
+        })?;
+        return Ok(Some(credentials));
+    }
+    Ok(None)
+}
+
 #[cfg(windows)]
 fn hide_console_window(command: &mut Command) {
     use std::os::windows::process::CommandExt;
@@ -2493,21 +2551,33 @@ async fn import_opencode_providers(state: State<'_, AppState>) -> Result<PublicS
         .args(["auth", "export"]);
     #[cfg(windows)]
     hide_console_window(&mut command);
-    let output = command.output().map_err(|error| {
-        format!(
-            "Impossible d'importer les comptes existants avec `opencode auth export` : {error}. Tu peux utiliser une API compatible OpenAI ou Ollama directement."
-        )
-    })?;
-    if !output.status.success() {
-        return Err(format!(
-            "L'import OpenCode a échoué : {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    let exported: Vec<serde_json::Value> =
-        serde_json::from_slice(&output.stdout).map_err(|error| {
-            format!("Le format d'export des comptes OpenCode est invalide : {error}")
-        })?;
+    let exported = match command.output() {
+        Ok(output) if output.status.success() => {
+            match serde_json::from_slice::<Vec<Value>>(&output.stdout) {
+                Ok(credentials) => credentials,
+                Err(error) => match read_opencode_auth_file()? {
+                    Some(credentials) => credentials,
+                    None => {
+                        return Err(format!(
+                            "Le format d’export des comptes OpenCode est invalide : {error}"
+                        ));
+                    }
+                },
+            }
+        }
+        output => match read_opencode_auth_file()? {
+            Some(credentials) => credentials,
+            None => {
+                let detail = match output {
+                    Ok(output) => String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+                    Err(error) => error.to_string(),
+                };
+                return Err(format!(
+                    "Impossible d’importer les comptes OpenCode : `opencode auth export` est indisponible ({detail}) et aucun fichier local auth.json compatible n’a été trouvé. Tu peux ajouter une API compatible OpenAI ou Ollama directement."
+                ));
+            }
+        },
+    };
     let mut imported_providers = Vec::new();
     for value in &exported {
         let Some(mut provider) = imported_provider(value) else {
@@ -4272,6 +4342,27 @@ mod tests {
             assert!(provider.models.is_empty());
             assert_eq!(provider.models_error, None);
         }
+    }
+
+    #[test]
+    fn parses_opencode_auth_json_provider_map() {
+        let credentials =
+            parse_opencode_auth_credentials(r#"{"groq":{"type":"key","key":"test-secret"}}"#)
+                .unwrap();
+        let provider = imported_provider(&credentials[0]).unwrap();
+        assert_eq!(provider.id, "groq");
+        assert_eq!(provider.api_key, "test-secret");
+    }
+
+    #[test]
+    fn parses_opencode_auth_json_export_array() {
+        let credentials = parse_opencode_auth_credentials(
+            r#"[{"integrationID":"google","value":{"type":"key","key":"test-secret"}}]"#,
+        )
+        .unwrap();
+        let provider = imported_provider(&credentials[0]).unwrap();
+        assert_eq!(provider.id, "google");
+        assert_eq!(provider.api_key, "test-secret");
     }
 
     #[test]
