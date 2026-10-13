@@ -221,7 +221,12 @@ function App() {
   const [contextCompacting, setContextCompacting] = useState(false);
   const [contextMeterOpen, setContextMeterOpen] = useState(false);
   const chatScroll = useRef<HTMLDivElement>(null);
+  const chatContent = useRef<HTMLDivElement>(null);
+  const chatScrollFrame = useRef<number | null>(null);
   const composerInput = useRef<HTMLTextAreaElement>(null);
+  const terminalEditor = useRef<HTMLDivElement>(null);
+  const terminalCaretMirror = useRef<HTMLDivElement>(null);
+  const [terminalCursor, setTerminalCursor] = useState({ left: 0, top: 0, visible: false, tick: 0 });
   const initialChatFocusApplied = useRef(false);
   const messageMenuRef = useRef<HTMLDivElement>(null);
   const stickToChatBottom = useRef(true);
@@ -245,6 +250,49 @@ function App() {
     ? localCommands.filter((command) => command.name.startsWith(input.slice(1).split(/\s+/)[0].toLowerCase())).slice(0, 5)
     : [];
   const modalOpen = Boolean(showProvider || showSkills || showCommand || pendingApproval || pendingQuestion || messageMenu);
+
+  const scrollChatToBottom = useCallback(() => {
+    const container = chatScroll.current;
+    if (container && stickToChatBottom.current) {
+      container.scrollTop = container.scrollHeight;
+    }
+  }, []);
+
+  const updateTerminalCursor = useCallback(() => {
+    const textarea = composerInput.current;
+    const editor = terminalEditor.current;
+    const mirror = terminalCaretMirror.current;
+    if (!textarea || !editor || !mirror) return;
+
+    const selectionStart = textarea.selectionStart;
+    const selectionEnd = textarea.selectionEnd;
+    if (selectionStart !== selectionEnd) {
+      setTerminalCursor((cursor) => cursor.visible ? { ...cursor, visible: false } : cursor);
+      return;
+    }
+
+    const style = window.getComputedStyle(textarea);
+    const fontSize = Number.parseFloat(style.fontSize);
+    const lineHeight = Number.parseFloat(style.lineHeight);
+    mirror.style.width = `${textarea.clientWidth}px`;
+    mirror.style.font = style.font;
+    mirror.style.letterSpacing = style.letterSpacing;
+    mirror.style.lineHeight = style.lineHeight;
+    mirror.style.padding = style.padding;
+    mirror.textContent = "";
+    mirror.append(document.createTextNode(textarea.value.slice(0, selectionStart)));
+    const marker = document.createElement("span");
+    marker.textContent = "\u200b";
+    mirror.append(marker);
+
+    const markerRect = marker.getBoundingClientRect();
+    const editorRect = editor.getBoundingClientRect();
+    const left = Math.round((markerRect.left - editorRect.left) * 100) / 100;
+    const top = Math.round((markerRect.top - editorRect.top - textarea.scrollTop - Math.max(0, (lineHeight - fontSize) / 2)) * 100) / 100;
+    setTerminalCursor((cursor) => cursor.left === left && cursor.top === top && cursor.visible
+      ? cursor
+      : { left, top, visible: true, tick: cursor.tick + 1 });
+  }, []);
 
   const syncState = useCallback(async () => {
     const next = await invoke<AppState>("load_app_state");
@@ -290,6 +338,19 @@ function App() {
     initialChatFocusApplied.current = true;
     window.requestAnimationFrame(() => composerInput.current?.focus());
   }, [ready, sessionId, projectPath]);
+
+  useEffect(() => {
+    const frame = window.requestAnimationFrame(updateTerminalCursor);
+    return () => window.cancelAnimationFrame(frame);
+  }, [input, updateTerminalCursor]);
+
+  useEffect(() => {
+    const editor = terminalEditor.current;
+    if (!editor) return;
+    const observer = new ResizeObserver(updateTerminalCursor);
+    observer.observe(editor);
+    return () => observer.disconnect();
+  }, [updateTerminalCursor]);
 
   useEffect(() => {
     if (!busy) return;
@@ -631,11 +692,28 @@ function App() {
   }, [projectPath]);
 
   useEffect(() => {
-    const container = chatScroll.current;
-    if (container && stickToChatBottom.current) {
-      container.scrollTop = container.scrollHeight;
+    if (chatScrollFrame.current !== null) {
+      window.cancelAnimationFrame(chatScrollFrame.current);
     }
-  }, [sessionId, currentSession?.messages, draftMessage, draftAnswer, liveTimeline]);
+    chatScrollFrame.current = window.requestAnimationFrame(() => {
+      chatScrollFrame.current = null;
+      scrollChatToBottom();
+    });
+    return () => {
+      if (chatScrollFrame.current !== null) {
+        window.cancelAnimationFrame(chatScrollFrame.current);
+        chatScrollFrame.current = null;
+      }
+    };
+  }, [sessionId, currentSession?.messages, draftMessage, draftAnswer, liveTimeline, scrollChatToBottom]);
+
+  useEffect(() => {
+    const content = chatContent.current;
+    if (!content) return;
+    const observer = new ResizeObserver(scrollChatToBottom);
+    observer.observe(content);
+    return () => observer.disconnect();
+  }, [sessionId, scrollChatToBottom]);
 
   const chooseProject = async () => {
     if (!isTauri()) {
@@ -1372,6 +1450,7 @@ function App() {
                   stickToChatBottom.current = element.scrollHeight - element.scrollTop - element.clientHeight <= 64;
                 }}
               >
+                <div ref={chatContent}>
                 <div className="chat-meta">
                   <span>SESSION // {sessionId.slice(-8).toUpperCase()} · {mode.toUpperCase()}{currentSession?.allowAllTools ? " · AUTO SESSION" : ""}</span>
                   <details className="context-details">
@@ -1405,46 +1484,70 @@ function App() {
                         </details>)}
                   {message.role !== "user" && busy && message.id === draftAnswer?.id && message.segments.length === 0 && <div className="thinking"><span className="pulse" /> {contextCompacting ? "LUCY CONDENSE LE CONTEXTE…" : "LUCY PRÉPARE SA RÉPONSE…"}<span className="thinking-wave" aria-hidden="true"><i /><i /><i /><i /></span></div>}
                 </article>)}
+                </div>
               </div>
               <div className="composer-wrap">
                 <div className="composer-shortcuts"><span>ENTER POUR ENVOYER · CTRL / ⌘ K POUR REVENIR AU CHAT</span><span>{busy ? "GÉNÉRATION EN COURS" : `${currentProvider?.name.toUpperCase() ?? "MODÈLE NON CONNECTÉ"} // ${modelId || "CHOISIR UN MODÈLE"}`}</span></div>
                 <div className={`composer ${busy ? "composer-generating" : ""} ${input.trim() ? "is-writing" : ""}`}>
                   {commandSuggestions.length > 0 && <div className="command-suggestions" id="command-suggestions" role="listbox" aria-label="Commandes locales">{commandSuggestions.map((command, index) => <button key={command.name} id={`command-option-${command.name}`} type="button" role="option" aria-selected={index === commandSuggestionIndex} className={index === commandSuggestionIndex ? "selected" : ""} onMouseEnter={() => setCommandSuggestionIndex(index)} onClick={() => { setInput(`/${command.name} `); setCommandSuggestionIndex(0); composerInput.current?.focus(); }}><span>/{command.name}</span><small>{command.description}</small></button>)}</div>}
-                  <textarea
-                    ref={composerInput}
-                    id="chat-composer"
-                    value={input}
-                    aria-label="Message à Lucy"
-                    aria-keyshortcuts="Control+K Meta+K"
-                    aria-autocomplete="list"
-                    aria-controls={commandSuggestions.length > 0 ? "command-suggestions" : undefined}
-                    aria-expanded={commandSuggestions.length > 0}
-                    aria-activedescendant={commandSuggestions.length > 0 ? `command-option-${commandSuggestions[commandSuggestionIndex]?.name}` : undefined}
-                    onChange={(event) => { setInput(event.target.value); setCommandSuggestionIndex(0); }}
-                    onKeyDown={(event) => {
-                      if (commandSuggestions.length > 0 && (event.key === "ArrowDown" || event.key === "ArrowUp")) {
-                        event.preventDefault();
-                        const direction = event.key === "ArrowDown" ? 1 : -1;
-                        setCommandSuggestionIndex((index) => (index + direction + commandSuggestions.length) % commandSuggestions.length);
-                      } else if (event.key === "Escape" && commandSuggestions.length > 0) {
-                        event.preventDefault();
-                        event.stopPropagation();
-                        setInput("");
-                      } else if (event.key === "Enter" && !event.shiftKey) {
-                        event.preventDefault();
-                        const exactCommand = commandSuggestions.find((command) => input.trim() === `/${command.name}`);
-                        if (exactCommand || commandSuggestions.length === 0) {
-                          void sendMessage();
-                        } else {
-                          setInput(`/${commandSuggestions[commandSuggestionIndex]?.name ?? commandSuggestions[0].name} `);
-                          setCommandSuggestionIndex(0);
-                          composerInput.current?.focus();
-                        }
-                      }
-                    }}
-                    placeholder="Écris un message à Lucy… · ⌘K pour revenir ici"
-                    rows={2}
-                  />
+                  <div className="terminal-header" aria-hidden="true">
+                    <span className="terminal-status"><i />LUCY <b>›</b> CHAT</span>
+                    <span>{busy ? "STREAM ACTIF" : "ENTRÉE LOCALE"}</span>
+                  </div>
+                  <div className="terminal-input-line">
+                    <span className="terminal-prompt" aria-hidden="true">❯</span>
+                    <div className="terminal-editor" ref={terminalEditor}>
+                      <div className="terminal-caret-mirror" ref={terminalCaretMirror} aria-hidden="true" />
+                      <textarea
+                        ref={composerInput}
+                        id="chat-composer"
+                        value={input}
+                        aria-label="Message à Lucy"
+                        aria-keyshortcuts="Control+K Meta+K"
+                        aria-autocomplete="list"
+                        aria-controls={commandSuggestions.length > 0 ? "command-suggestions" : undefined}
+                        aria-expanded={commandSuggestions.length > 0}
+                        aria-activedescendant={commandSuggestions.length > 0 ? `command-option-${commandSuggestions[commandSuggestionIndex]?.name}` : undefined}
+                        onChange={(event) => { setInput(event.target.value); setCommandSuggestionIndex(0); }}
+                        onClick={updateTerminalCursor}
+                        onKeyUp={updateTerminalCursor}
+                        onSelect={updateTerminalCursor}
+                        onScroll={updateTerminalCursor}
+                        onFocus={updateTerminalCursor}
+                        onKeyDown={(event) => {
+                          if (commandSuggestions.length > 0 && (event.key === "ArrowDown" || event.key === "ArrowUp")) {
+                            event.preventDefault();
+                            const direction = event.key === "ArrowDown" ? 1 : -1;
+                            setCommandSuggestionIndex((index) => (index + direction + commandSuggestions.length) % commandSuggestions.length);
+                          } else if (event.key === "Escape" && commandSuggestions.length > 0) {
+                            event.preventDefault();
+                            event.stopPropagation();
+                            setInput("");
+                          } else if (event.key === "Enter" && !event.shiftKey) {
+                            event.preventDefault();
+                            const exactCommand = commandSuggestions.find((command) => input.trim() === `/${command.name}`);
+                            if (exactCommand || commandSuggestions.length === 0) {
+                              void sendMessage();
+                            } else {
+                              setInput(`/${commandSuggestions[commandSuggestionIndex]?.name ?? commandSuggestions[0].name} `);
+                              setCommandSuggestionIndex(0);
+                              composerInput.current?.focus();
+                            }
+                          } else {
+                            return;
+                          }
+                        }}
+                        placeholder="Écris ta requête… (Maj+Entrée pour une nouvelle ligne)"
+                        rows={2}
+                      />
+                      <span
+                        key={terminalCursor.tick}
+                        className={`terminal-cursor ${terminalCursor.visible ? "visible" : ""}`}
+                        aria-hidden="true"
+                        style={{ left: terminalCursor.left, top: terminalCursor.top }}
+                      />
+                    </div>
+                  </div>
                   <div className="composer-bottom">
                     <select className="composer-select model-select" value={`${providerId}::${modelId}`} aria-label="Modèle d’IA" disabled={busy || appState.providers.length === 0} onChange={(event) => void selectModel(event.target.value)}>
                       {appState.providers.flatMap((provider) => provider.models.map((model) =>
