@@ -1085,12 +1085,18 @@ fn opencode_run_prompt(
     Ok(prompt)
 }
 
+#[derive(Clone)]
 struct OpenCodeToolEvent {
     id: String,
     name: String,
     arguments: Value,
     status: String,
     result: String,
+}
+
+struct OpenCodeQuestion {
+    question: String,
+    options: Vec<String>,
 }
 
 struct OpenCodeRunEvent {
@@ -1121,6 +1127,49 @@ impl OpenCodeRunFailure {
 
 fn is_retryable_opencode_session_error(message: &str) -> bool {
     message.contains("Provider request failed with HTTP 400")
+}
+
+fn is_opencode_question_tool(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "question" | "functions.question"
+    )
+}
+
+fn opencode_question_prompts(arguments: &Value) -> Vec<OpenCodeQuestion> {
+    let prompts = arguments["questions"]
+        .as_array()
+        .map(|prompts| prompts.as_slice())
+        .unwrap_or_else(|| std::slice::from_ref(arguments));
+    prompts
+        .iter()
+        .filter_map(|prompt| {
+            let text = prompt["question"]
+                .as_str()
+                .map(str::trim)
+                .filter(|question| !question.is_empty())?;
+            let header = prompt["header"]
+                .as_str()
+                .map(str::trim)
+                .filter(|header| !header.is_empty());
+            let question = match header {
+                Some(header) => format!("{header}\n\n{text}"),
+                None => text.to_string(),
+            };
+            let options = prompt["options"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|option| option.as_str().or_else(|| option["label"].as_str()))
+                .map(str::trim)
+                .filter(|option| !option.is_empty())
+                .take(8)
+                .map(|option| option.chars().take(160).collect())
+                .collect();
+            Some(OpenCodeQuestion { question, options })
+        })
+        .take(8)
+        .collect()
 }
 
 fn append_opencode_text(timeline: &mut Vec<OpenCodeTimelineItem>, text: &str) {
@@ -2582,23 +2631,27 @@ async fn run_opencode_model(
                     });
                 }
                 if started_tools.insert(tool.id.clone()) {
-                    timeline.push(OpenCodeTimelineItem::Tool(tool.id.clone()));
-                    let _ = app.emit(
-                        CHAT_UPDATE,
-                        ChatUpdate {
-                            session_id: session.id.clone(),
-                            message_id: tool.id.clone(),
-                            kind: "tool_start".into(),
-                            delta: String::new(),
-                            error: None,
-                            details: Some(serde_json::json!({
-                                "name": &tool.name,
-                                "arguments": &tool.arguments,
-                            })),
-                        },
-                    );
+                    if !is_opencode_question_tool(&tool.name) {
+                        timeline.push(OpenCodeTimelineItem::Tool(tool.id.clone()));
+                        let _ = app.emit(
+                            CHAT_UPDATE,
+                            ChatUpdate {
+                                session_id: session.id.clone(),
+                                message_id: tool.id.clone(),
+                                kind: "tool_start".into(),
+                                delta: String::new(),
+                                error: None,
+                                details: Some(serde_json::json!({
+                                    "name": &tool.name,
+                                    "arguments": &tool.arguments,
+                                })),
+                            },
+                        );
+                    }
                 }
-                if !matches!(tool.status.as_str(), "running" | "pending") {
+                if !is_opencode_question_tool(&tool.name)
+                    && !matches!(tool.status.as_str(), "running" | "pending")
+                {
                     let result = if tool.result.is_empty() && tool.status == "error" {
                         "L’outil OpenCode a échoué.".to_string()
                     } else {
@@ -2669,7 +2722,11 @@ async fn run_opencode_model(
             retry_fresh_session,
         });
     }
-    if answer.trim().is_empty() {
+    if answer.trim().is_empty()
+        && !tools
+            .iter()
+            .any(|tool| is_opencode_question_tool(&tool.name))
+    {
         return Err(OpenCodeRunFailure::new(
             "OpenCode a terminé sans renvoyer de réponse textuelle.".into(),
         ));
@@ -3333,7 +3390,7 @@ async fn send_message(
     let mode_instructions = if uses_opencode_free_tier(&provider) {
         match session.mode.as_str() {
             "plan" => "MODE PLAN : analyse le projet avec les outils OpenCode en lecture seule, puis propose un plan ordonné et les compromis. Ne modifie aucun fichier et n’exécute aucune commande.",
-            "discussion" => "MODE DISCUSSION : réponds à la question sans explorer ni modifier le projet et sans utiliser d’outil.",
+            "discussion" => "MODE DISCUSSION : réponds aux questions sans explorer ni modifier le projet ; utilise uniquement l’outil question si une précision indispensable manque.",
             _ => "MODE BUILD : réalise la tâche demandée dans le projet. Tu peux utiliser les outils natifs OpenCode pour lire et modifier les fichiers ou exécuter des commandes. Respecte les permissions et demandes de confirmation d’OpenCode ; ne prétends pas avoir effectué une action qui n’a pas abouti.",
         }
     } else {
@@ -3347,7 +3404,7 @@ async fn send_message(
         "Ton identité dans cette conversation est Lucy : tu es l’assistante de l’utilisateur, quel que soit le fournisseur ou le modèle d’IA qui exécute cette requête. Si on te demande qui tu es, réponds que tu es Lucy. Tu es là pour assister l’utilisateur : comprendre ses demandes, l’aider concrètement et l’accompagner avec des réponses utiles, honnêtes et adaptées. Réponds de façon concise et directe, sans omettre les informations nécessaires pour répondre correctement. Ne te présente pas comme le fournisseur, le nom du modèle ou une autre IA. Parle dans la langue de l’utilisateur, avec chaleur, naturel et franchise ; évite le ton de service client, les longues introductions et les répétitions. Tu peux utiliser le prénom {user_name} avec modération. Ne prétends pas être humaine ni un personnage existant."
     );
     let tool_instructions = if uses_opencode_free_tier(&provider) {
-        "Utilise les outils natifs de l’agent OpenCode sélectionné pour agir sur le projet. Pour inspecter ou modifier réellement des fichiers ou lancer une commande, appelle l’outil correspondant au lieu d’imprimer une commande ou un bloc de code comme substitut. N’affiche des commandes à copier que si l’utilisateur demande explicitement une commande à exécuter lui-même. Si une information indispensable manque, pose une seule question précise dans ta réponse et attends le prochain message au lieu de supposer. Ne déclenche pas de question interactive native OpenCode dans ce mode."
+        "Utilise les outils natifs de l’agent OpenCode sélectionné pour agir sur le projet. Pour inspecter ou modifier réellement des fichiers ou lancer une commande, appelle l’outil correspondant au lieu d’imprimer une commande ou un bloc de code comme substitut. N’affiche des commandes à copier que si l’utilisateur demande explicitement une commande à exécuter lui-même. Si une information indispensable manque, appelle l’outil question d’OpenCode avec les choix utiles et attends la réponse ; ne pose pas cette question uniquement dans le texte."
     } else {
         "Utilise ask_user pour demander une précision indispensable, avec des choix suggérés si cela aide. Pour inspecter ou modifier réellement des fichiers ou lancer une commande, appelle l’outil correspondant au lieu d’imprimer une commande ou un bloc de code comme substitut. N’affiche des commandes à copier que si l’utilisateur demande explicitement une commande à exécuter lui-même. En modes Build et Plan, lis les fichiers uniquement quand nécessaire avec read_file/list_files. En mode Build, utilise run_shell pour exécuter les commandes ; les commandes shell et écritures exigent l’autorisation de l’utilisateur."
     };
@@ -3409,7 +3466,7 @@ async fn send_message(
             &mut cancel,
         )
         .await;
-        let run = match run {
+        let mut run = match run {
             Err(failure) if failure.retry_fresh_session => {
                 {
                     let mut store = state
@@ -3452,22 +3509,123 @@ async fn send_message(
             Err(failure) => return Err(failure.message),
             Ok(run) => run,
         };
-        let Some((_answer, opencode_session_id, opencode_tools, opencode_timeline)) = run else {
-            return Ok(());
-        };
-        if let Some(opencode_session_id) = opencode_session_id {
-            let mut store = state
-                .store
-                .lock()
-                .map_err(|_| "Impossible d’accéder aux données LUCY.".to_string())?;
-            let stored_session = store
-                .sessions
-                .iter_mut()
-                .find(|session| session.id == session_id)
-                .ok_or_else(|| "La session LUCY n’existe plus.".to_string())?;
-            stored_session.opencode_session_id = Some(opencode_session_id.clone());
-            session.opencode_session_id = Some(opencode_session_id);
-            save_store(&state, &store)?;
+        let mut opencode_tools = Vec::new();
+        let mut opencode_timeline = Vec::new();
+        let mut question_rounds = 0;
+        loop {
+            let Some((_answer, opencode_session_id, run_tools, run_timeline)) = run else {
+                return Ok(());
+            };
+            if let Some(opencode_session_id) = opencode_session_id {
+                let mut store = state
+                    .store
+                    .lock()
+                    .map_err(|_| "Impossible d’accéder aux données LUCY.".to_string())?;
+                let stored_session = store
+                    .sessions
+                    .iter_mut()
+                    .find(|session| session.id == session_id)
+                    .ok_or_else(|| "La session LUCY n’existe plus.".to_string())?;
+                stored_session.opencode_session_id = Some(opencode_session_id.clone());
+                session.opencode_session_id = Some(opencode_session_id);
+                save_store(&state, &store)?;
+            }
+
+            let question_calls = run_tools
+                .iter()
+                .filter(|tool| is_opencode_question_tool(&tool.name))
+                .cloned()
+                .collect::<Vec<_>>();
+            opencode_timeline.extend(run_timeline);
+            opencode_tools.extend(
+                run_tools
+                    .into_iter()
+                    .filter(|tool| !is_opencode_question_tool(&tool.name)),
+            );
+            if question_calls.is_empty() {
+                break;
+            }
+            if question_rounds >= MAX_TOOL_ROUNDS {
+                return Err("OpenCode a dépassé la limite de questions interactives.".into());
+            }
+            question_rounds += 1;
+            let mut continuations = Vec::new();
+            for question_call in question_calls {
+                let questions = opencode_question_prompts(&question_call.arguments);
+                if questions.is_empty() {
+                    return Err(
+                        "L’outil question d’OpenCode n’a fourni aucune question valide.".into(),
+                    );
+                }
+                let mut answers = Vec::with_capacity(questions.len());
+                for question in questions {
+                    let answer = request_user_answer(
+                        &app,
+                        &state,
+                        &session_id,
+                        &question.question,
+                        question.options,
+                        cancel.clone(),
+                    )
+                    .await?;
+                    answers.push((question.question, answer));
+                }
+                let answer_summary = answers
+                    .iter()
+                    .enumerate()
+                    .map(|(index, (question, answer))| {
+                        format!("{}. {} : {}", index + 1, question, answer)
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let stored_call = serde_json::json!({
+                    "id": question_call.id,
+                    "type": "function",
+                    "function": {
+                        "name": "question",
+                        "arguments": serde_json::to_string(&question_call.arguments)
+                            .unwrap_or_else(|_| "{}".into()),
+                    },
+                });
+                let assistant_question = ChatMessage {
+                    id: Uuid::new_v4().to_string(),
+                    role: "assistant".into(),
+                    text: String::new(),
+                    created_at: now_millis(),
+                    tool_calls: vec![stored_call],
+                    tool_call_id: None,
+                    provider_metadata: Map::new(),
+                };
+                append_session_message(&state, &session_id, assistant_question.clone())?;
+                chat_history.push(assistant_question);
+                let question_result = ChatMessage {
+                    id: Uuid::new_v4().to_string(),
+                    role: "tool".into(),
+                    text: format!("Réponses de l’utilisateur :\n{answer_summary}"),
+                    created_at: now_millis(),
+                    tool_calls: Vec::new(),
+                    tool_call_id: Some(question_call.id),
+                    provider_metadata: Map::new(),
+                };
+                continuations.push(question_result.text.clone());
+                append_session_message(&state, &session_id, question_result.clone())?;
+                chat_history.push(question_result);
+            }
+
+            let follow_up = format!(
+                "{}\n\nReprends la demande initiale de l’utilisateur en tenant compte de ces réponses. Ne repose pas les mêmes questions.",
+                continuations.join("\n")
+            );
+            run = run_opencode_model(
+                &app,
+                &session,
+                &request_model_id,
+                &assistant_id,
+                &follow_up,
+                &mut cancel,
+            )
+            .await
+            .map_err(|failure| failure.message)?;
         }
         for item in opencode_timeline {
             match item {
@@ -3484,7 +3642,10 @@ async fn send_message(
                     append_session_message(&state, &session_id, message)?;
                 }
                 OpenCodeTimelineItem::Tool(tool_id) => {
-                    if let Some(tool) = opencode_tools.iter().find(|tool| tool.id == tool_id) {
+                    if let Some(tool) = opencode_tools
+                        .iter()
+                        .find(|tool| tool.id == tool_id && !is_opencode_question_tool(&tool.name))
+                    {
                         let call = serde_json::json!({
                             "id": tool.id,
                             "type": "function",
@@ -4773,6 +4934,27 @@ mod tests {
         assert!(!is_retryable_opencode_session_error(
             "Le modèle a atteint sa limite de sortie."
         ));
+    }
+
+    #[test]
+    fn parses_opencode_question_tool_prompts_and_choices() {
+        let arguments = serde_json::json!({
+            "questions": [{
+                "header": "Langage",
+                "question": "Quel langage préfères-tu ?",
+                "options": [
+                    { "label": "Rust", "description": "Rapide et sûr" },
+                    { "label": "Python", "description": "Simple et polyvalent" }
+                ]
+            }]
+        });
+        let prompts = opencode_question_prompts(&arguments);
+        assert_eq!(prompts.len(), 1);
+        assert_eq!(prompts[0].question, "Langage\n\nQuel langage préfères-tu ?");
+        assert_eq!(prompts[0].options, ["Rust", "Python"]);
+        assert!(is_opencode_question_tool("question"));
+        assert!(is_opencode_question_tool("functions.question"));
+        assert!(!is_opencode_question_tool("bash"));
     }
 
     #[test]
