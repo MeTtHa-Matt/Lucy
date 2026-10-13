@@ -2435,14 +2435,13 @@ async fn run_opencode_model(
             timeline,
         )))
     };
-    let output = match tokio::time::timeout(Duration::from_secs(300), run).await {
-        Ok(Ok(Some(output))) => output,
-        Ok(Ok(None)) => {
+    let output = match run.await {
+        Ok(Some(output)) => output,
+        Ok(None) => {
             emit_chat_stopped(app, &session.id);
             return Ok(None);
         }
-        Ok(Err(error)) => return Err(error),
-        Err(_) => return Err("Le moteur OpenCode a dépassé la limite de 5 minutes.".into()),
+        Err(error) => return Err(error),
     };
     let stderr = stderr_task
         .await
