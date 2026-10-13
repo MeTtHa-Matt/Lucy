@@ -271,6 +271,7 @@ function App() {
   const [pendingApproval, setPendingApproval] = useState<ToolApproval | null>(null);
   const [pendingQuestion, setPendingQuestion] = useState<UserQuestion | null>(null);
   const [questionAnswer, setQuestionAnswer] = useState("");
+  const [questionOtherSelected, setQuestionOtherSelected] = useState(false);
   const [liveTimeline, setLiveTimeline] = useState<TimelineSegment[]>([]);
   const [projectContext, setProjectContext] = useState<ProjectContext | null>(null);
   const [contextLoading, setContextLoading] = useState(false);
@@ -733,6 +734,7 @@ function App() {
       if (event.payload.sessionId !== sessionId) return;
       setPendingQuestion(event.payload);
       setQuestionAnswer("");
+      setQuestionOtherSelected(event.payload.options.length === 0);
     }).then((dispose) => { unlisten = dispose; });
     return () => unlisten?.();
   }, [sessionId]);
@@ -1322,6 +1324,7 @@ function App() {
       });
       setPendingQuestion(null);
       setQuestionAnswer("");
+      setQuestionOtherSelected(false);
       setError("");
     } catch (reason) {
       setError(friendlyError(reason));
@@ -1986,16 +1989,45 @@ function App() {
           <div className="modal-kicker">PRÉCISION // LUCY A BESOIN DE TON AVIS</div>
           <h2 id="question-title">{pendingQuestion.question}</h2>
           <p>Ta réponse permettra à Lucy de poursuivre sans faire de suppositions.</p>
-          {pendingQuestion.options.length > 0 && <div className="question-options">
-            {pendingQuestion.options.map((option) => <button
-              key={option}
-              type="button"
-              className={questionAnswer === option ? "selected" : ""}
-              onClick={() => setQuestionAnswer(option)}
-            >{option}</button>)}
-          </div>}
-          <label className="field-label" htmlFor="question-answer">{pendingQuestion.options.length > 0 ? "CHOISIS OU ÉCRIS TA RÉPONSE" : "TA RÉPONSE"}</label>
-          <textarea id="question-answer" autoFocus value={questionAnswer} onChange={(event) => setQuestionAnswer(event.target.value)} maxLength={2_000} rows={3} required />
+          {pendingQuestion.options.length > 0 && <>
+            <div className="question-options" role="group" aria-label="Réponses proposées">
+              {pendingQuestion.options.map((option, index) => <button
+                key={option}
+                type="button"
+                className={questionAnswer === option && !questionOtherSelected ? "selected" : ""}
+                aria-pressed={questionAnswer === option && !questionOtherSelected}
+                onClick={() => {
+                  setQuestionAnswer(option);
+                  setQuestionOtherSelected(false);
+                }}
+              >
+                <span className="question-option-index">{String(index + 1).padStart(2, "0")}</span>
+                <span className="question-option-copy">{option}</span>
+                <span className="question-option-mark" aria-hidden="true">↵</span>
+              </button>)}
+              <button
+                type="button"
+                className={`question-option-other ${questionOtherSelected ? "selected" : ""}`}
+                aria-pressed={questionOtherSelected}
+                onClick={() => {
+                  setQuestionAnswer("");
+                  setQuestionOtherSelected(true);
+                }}
+              >
+                <span className="question-option-index" aria-hidden="true">✎</span>
+                <span className="question-option-copy">Autre</span>
+                <span className="question-option-mark" aria-hidden="true">＋</span>
+              </button>
+            </div>
+            {questionOtherSelected && <>
+              <label className="field-label" htmlFor="question-answer">TA RÉPONSE PERSONNALISÉE</label>
+              <textarea id="question-answer" autoFocus value={questionAnswer} onChange={(event) => setQuestionAnswer(event.target.value)} maxLength={2_000} rows={3} required placeholder="Écris ta réponse…" />
+            </>}
+          </>}
+          {pendingQuestion.options.length === 0 && <>
+            <label className="field-label" htmlFor="question-answer">TA RÉPONSE</label>
+            <textarea id="question-answer" autoFocus value={questionAnswer} onChange={(event) => setQuestionAnswer(event.target.value)} maxLength={2_000} rows={3} required />
+          </>}
           <div className="modal-actions">
             <button className="reject-button" type="button" onClick={() => void stopGeneration()}>ARRÊTER</button>
             <button className="approve-button" type="submit" disabled={!questionAnswer.trim()}>RÉPONDRE ET CONTINUER ↗</button>
