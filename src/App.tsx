@@ -2,7 +2,9 @@ import { invoke, isTauri } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { open } from "@tauri-apps/plugin-dialog";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
+
+const MarkdownResponse = lazy(() => import("./MarkdownResponse"));
 
 type Provider = {
   id: string;
@@ -100,6 +102,22 @@ const localCommands = [
   { name: "terminal", description: "Ouvrir un terminal local avec confirmation" },
 ];
 
+const formatToolArguments = (tool: ToolActivity) => {
+  const args = tool.arguments;
+  if (tool.name === "run_shell" || tool.name === "bash") {
+    return String(args.command ?? "");
+  }
+  if (tool.name === "edit") {
+    const path = String(args.path ?? args.filePath ?? "");
+    const oldText = String(args.oldString ?? args.old_string ?? "");
+    const newText = String(args.newString ?? args.new_string ?? "");
+    if (oldText || newText) {
+      return `Fichier : ${path}\n\n− Ancien contenu\n${oldText}\n\n+ Nouveau contenu\n${newText}`;
+    }
+  }
+  return JSON.stringify(args, null, 2);
+};
+
 const friendlyError = (error: unknown) => error instanceof Error ? error.message : String(error);
 
 function App() {
@@ -111,6 +129,7 @@ function App() {
   const [modelId, setModelId] = useState("");
   const [mode, setMode] = useState<"build" | "plan" | "discussion">("build");
   const [input, setInput] = useState("");
+  const [commandSuggestionIndex, setCommandSuggestionIndex] = useState(0);
   const [draftMessage, setDraftMessage] = useState<ChatMessage | null>(null);
   const [draftAnswer, setDraftAnswer] = useState<ChatMessage | null>(null);
   const [clearedChat, setClearedChat] = useState<{ sessionId: string; messageCount: number } | null>(null);
@@ -147,6 +166,8 @@ function App() {
   const [contextCompacting, setContextCompacting] = useState(false);
   const [contextMeterOpen, setContextMeterOpen] = useState(false);
   const chatScroll = useRef<HTMLDivElement>(null);
+  const composerInput = useRef<HTMLTextAreaElement>(null);
+  const initialChatFocusApplied = useRef(false);
   const messageMenuRef = useRef<HTMLDivElement>(null);
   const stickToChatBottom = useRef(true);
   const streamedEvents = useRef<StreamedEvent[]>([]);
@@ -168,6 +189,7 @@ function App() {
   const commandSuggestions = input.startsWith("/")
     ? localCommands.filter((command) => command.name.startsWith(input.slice(1).split(/\s+/)[0].toLowerCase())).slice(0, 5)
     : [];
+  const modalOpen = Boolean(showProvider || showSkills || showCommand || pendingApproval || pendingQuestion || messageMenu);
 
   const syncState = useCallback(async () => {
     const next = await invoke<AppState>("load_app_state");
@@ -207,6 +229,12 @@ function App() {
     const timer = window.setInterval(() => setRetryClock(Date.now()), 200);
     return () => window.clearInterval(timer);
   }, [retryStatus?.retryAt]);
+
+  useEffect(() => {
+    if (!ready || !sessionId || !projectPath || initialChatFocusApplied.current) return;
+    initialChatFocusApplied.current = true;
+    window.requestAnimationFrame(() => composerInput.current?.focus());
+  }, [ready, sessionId, projectPath]);
 
   useEffect(() => {
     if (!busy) return;
@@ -904,7 +932,7 @@ function App() {
     }
   };
 
-  const openMessageMenu = (message: { id: string; text?: string }, event: React.MouseEvent) => {
+  const openMessageMenu = (message: { id: string; text?: string }, event: React.SyntheticEvent) => {
     event.preventDefault();
     event.stopPropagation();
     setMessageMenu({ messageId: message.id, text: message.text ?? "", selected: 0 });
@@ -983,7 +1011,7 @@ function App() {
   useEffect(() => {
     const onEscape = (event: KeyboardEvent) => {
       if (event.key !== "Escape") return;
-      if (messageMenu) return;
+      if (modalOpen) return;
       if (busy) {
         event.preventDefault();
         void stopGeneration();
@@ -991,7 +1019,62 @@ function App() {
     };
     window.addEventListener("keydown", onEscape);
     return () => window.removeEventListener("keydown", onEscape);
-  }, [busy, messageMenu, sessionId]);
+  }, [busy, modalOpen, sessionId]);
+
+  useEffect(() => {
+    if (!ready || modalOpen) return;
+    const onShortcut = (event: KeyboardEvent) => {
+      const modifier = event.metaKey || event.ctrlKey;
+      if (modifier && !event.shiftKey && event.key.toLowerCase() === "k") {
+        event.preventDefault();
+        composerInput.current?.focus();
+      } else if (modifier && event.shiftKey && event.key.toLowerCase() === "n") {
+        event.preventDefault();
+        void createSession();
+      }
+    };
+    window.addEventListener("keydown", onShortcut);
+    return () => window.removeEventListener("keydown", onShortcut);
+  }, [ready, modalOpen, createSession]);
+
+  useEffect(() => {
+    if (!modalOpen) return;
+    const modal = document.querySelector<HTMLElement>(
+      ".modal-backdrop .modal-card, .message-menu-backdrop .message-context-menu",
+    );
+    if (!modal) return;
+    const focusable = () => Array.from(modal.querySelectorAll<HTMLElement>(
+      'button:not(:disabled), input:not(:disabled), textarea:not(:disabled), select:not(:disabled), [tabindex]:not([tabindex="-1"])',
+    ));
+    const previousFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    const preferred = modal.querySelector<HTMLElement>(
+      'input[autofocus], textarea[autofocus], select[autofocus], input:not([type="hidden"]), textarea, select, button:not(:disabled)',
+    );
+    preferred?.focus();
+    const onTab = (event: KeyboardEvent) => {
+      if (event.key !== "Tab") return;
+      const items = focusable();
+      if (items.length === 0) {
+        event.preventDefault();
+        modal.focus();
+        return;
+      }
+      const first = items[0];
+      const last = items.at(-1);
+      if (event.shiftKey && (document.activeElement === first || !modal.contains(document.activeElement))) {
+        event.preventDefault();
+        last?.focus();
+      } else if (!event.shiftKey && (document.activeElement === last || !modal.contains(document.activeElement))) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+    window.addEventListener("keydown", onTab);
+    return () => {
+      window.removeEventListener("keydown", onTab);
+      if (previousFocus?.isConnected) previousFocus.focus();
+    };
+  }, [modalOpen]);
 
   const executeShell = async (event: React.FormEvent) => {
     event.preventDefault();
@@ -1045,6 +1128,30 @@ function App() {
       setError(friendlyError(reason));
     }
   };
+
+  useEffect(() => {
+    const onModalEscape = (event: KeyboardEvent) => {
+      if (event.key !== "Escape" || messageMenu) return;
+      if (pendingApproval) {
+        event.preventDefault();
+        void resolveApproval(false);
+      } else if (pendingQuestion) {
+        event.preventDefault();
+        void stopGeneration();
+      } else if (showCommand) {
+        event.preventDefault();
+        setShowCommand(false);
+      } else if (showSkills) {
+        event.preventDefault();
+        setShowSkills(false);
+      } else if (showProvider) {
+        event.preventDefault();
+        setShowProvider(false);
+      }
+    };
+    window.addEventListener("keydown", onModalEscape);
+    return () => window.removeEventListener("keydown", onModalEscape);
+  }, [messageMenu, pendingApproval, pendingQuestion, showCommand, showSkills, showProvider, resolveApproval, stopGeneration]);
 
   const changeMode = async (nextMode: "build" | "plan" | "discussion") => {
     setMode(nextMode);
@@ -1139,6 +1246,7 @@ function App() {
 
   return (
     <main className={`app-shell ${appState.isHyprlandSession ? "hyprland-session" : ""}`}>
+      <a className="skip-link" href="#chat-composer">Aller à la zone de chat</a>
       {!appState.isHyprlandSession && <header className="titlebar" data-tauri-drag-region>
         <div className="brand-lockup" data-tauri-drag-region>
           <span className="brand-mark">L</span><span className="brand-name">LUCY</span>
@@ -1165,7 +1273,7 @@ function App() {
             {visibleSessions.map((session) => (
               <div key={session.id} className={`session-row ${session.id === sessionId ? "selected" : ""}`}>
                 <button className="session-select" onClick={() => selectSession(session.id)}><span className="session-glyph">›_</span><span className="session-title">{session.title}</span></button>
-                <button className="session-delete" aria-label="Supprimer la session" onClick={() => void removeSession(session)}>×</button>
+                <button className="session-delete" aria-label={`Supprimer la session ${session.title}`} onClick={() => void removeSession(session)}>×</button>
               </div>
             ))}
             {visibleSessions.length === 0 && <p className="empty-side">{ready ? "Aucune session pour l’instant." : "Chargement…"}</p>}
@@ -1180,8 +1288,8 @@ function App() {
           <div className="topbar">
             <div className="breadcrumb"><span className="crumb-dim">LUCY</span><span className="crumb-slash">/</span><span>{currentSession?.title ?? (projectPath ? "SESSION EN ATTENTE" : "SYSTÈME HORS LIGNE")}</span></div>
             <div className="toolbar-actions">
-              <button className="icon-button" title="Nouvelle session" onClick={() => void createSession()}>＋</button>
-              <button className="icon-button" title="Terminal avec confirmation" onClick={() => setShowCommand(true)} disabled={!projectPath}>$_</button>
+              <button className="icon-button" title="Nouvelle session" aria-label="Nouvelle session" onClick={() => void createSession()}>＋</button>
+              <button className="icon-button" title="Terminal avec confirmation" aria-label="Ouvrir le terminal local" onClick={() => setShowCommand(true)} disabled={!projectPath}>$_</button>
             </div>
           </div>
 
@@ -1223,13 +1331,13 @@ function App() {
                 </div>
                 {messages.length === 0 && <div className="starter-card"><span className="starter-icon">◈</span><h2>{currentProvider && modelId ? "Connexion directe établie." : "Choisis ton modèle."}</h2><p>{currentProvider && modelId ? "La conversation est privée, conservée localement et envoyée directement à ton fournisseur." : "Sélectionne un modèle dans la barre de saisie ou connecte un fournisseur pour commencer."}</p></div>}
                 {displayMessages.map((message) => <article key={message.id} className={`message ${message.role === "user" ? "user-message" : "assistant-message"}`}>
-                  <div className="message-heading"><span className="message-avatar">{message.role === "user" ? "YOU" : "L"}</span><span>{message.role === "user" ? "TOI" : "LUCY"}</span><span className="message-time">{new Date(message.createdAt).toLocaleTimeString("fr-FR", { hour: "2-digit", minute: "2-digit" })}</span></div>
+                  <div className="message-heading"><span className="message-avatar">{message.role === "user" ? "YOU" : "L"}</span><span>{message.role === "user" ? "TOI" : "LUCY"}</span>{message.role !== "user" && busy && message.id === displayMessages.at(-1)?.id && <span className="streaming-label" aria-label="Réponse en cours"><i /><i /><i /></span>}<span className="message-time">{new Date(message.createdAt).toLocaleTimeString("fr-FR", { hour: "2-digit", minute: "2-digit" })}</span></div>
                   {message.role === "user"
                     ? editingMessageId === message.id
                       ? <div className="message-edit"><textarea autoFocus value={editedText} onChange={(event) => setEditedText(event.target.value)} onKeyDown={(event) => { if (event.key === "Escape") setEditingMessageId(""); }} /><div><button onClick={() => setEditingMessageId("")}>ANNULER</button><button className="edit-submit" disabled={!editedText.trim() || busy} onClick={() => void saveEditedMessage()}>RENVOYER ↗</button></div></div>
-                      : <div className="message-body user-message-clickable" onClick={(event) => openMessageMenu(message, event)} onContextMenu={(event) => openMessageMenu(message, event)}>{message.text}</div>
+                      : <div className="message-body user-message-clickable" tabIndex={0} aria-haspopup="dialog" aria-label="Actions sur ce message" onClick={(event) => openMessageMenu(message, event)} onContextMenu={(event) => openMessageMenu(message, event)} onKeyDown={(event) => { if (event.key === "Enter" || event.key === " " || (event.shiftKey && event.key === "F10")) { event.preventDefault(); openMessageMenu(message, event); } }}>{message.text}</div>
                     : message.segments.map((segment, index) => segment.kind === "text"
-                      ? <div key={`${segment.id}-${index}`} className="message-body">{segment.text}</div>
+                      ? <div key={`${segment.id}-${index}`} className={`message-body ${busy && segment.id === lastStreamMessageId.current ? "streaming-text" : ""}`}><div className="markdown-body"><Suspense fallback={<span className="markdown-loading">{segment.text}</span>}><MarkdownResponse>{segment.text}</MarkdownResponse></Suspense></div></div>
                       : segment.tool.name === "report_progress"
                         ? <aside key={segment.tool.id} className="reasoning-summary">
                           <span>RAISONNEMENT SYNTHÉTIQUE</span>
@@ -1237,17 +1345,51 @@ function App() {
                         </aside>
                         : <details key={segment.tool.id} className={`tool-activity ${segment.tool.result !== undefined ? "complete" : ""}`} open>
                           <summary><span>{segment.tool.result !== undefined ? "✓" : "◌"}</span>{segment.tool.name === "ask_user" ? "Question posée" : segment.tool.name}</summary>
-                          <pre>{segment.tool.name === "run_shell" ? String(segment.tool.arguments.command ?? "") : JSON.stringify(segment.tool.arguments, null, 2)}</pre>
+                          <pre>{formatToolArguments(segment.tool)}</pre>
                           {segment.tool.result?.trim() && <pre className="tool-result">{segment.tool.result}</pre>}
                         </details>)}
-                  {message.role !== "user" && busy && message.id === draftAnswer?.id && message.segments.length === 0 && <div className="thinking"><span className="pulse" /> {contextCompacting ? "LUCY CONDENSE LE CONTEXTE…" : "LUCY RÉPOND…"}</div>}
+                  {message.role !== "user" && busy && message.id === draftAnswer?.id && message.segments.length === 0 && <div className="thinking"><span className="pulse" /> {contextCompacting ? "LUCY CONDENSE LE CONTEXTE…" : "LUCY PRÉPARE SA RÉPONSE…"}<span className="thinking-wave" aria-hidden="true"><i /><i /><i /><i /></span></div>}
                 </article>)}
               </div>
               <div className="composer-wrap">
-                <div className="composer-shortcuts"><span>ENTER POUR ENVOYER</span><span>{busy ? "GÉNÉRATION EN COURS" : `${currentProvider?.name.toUpperCase() ?? "MODÈLE NON CONNECTÉ"} // ${modelId || "CHOISIR UN MODÈLE"}`}</span></div>
-                <div className={`composer ${busy ? "composer-generating" : ""}`}>
-                  {commandSuggestions.length > 0 && <div className="command-suggestions">{commandSuggestions.map((command) => <button key={command.name} onClick={() => setInput(`/${command.name} `)}><span>/{command.name}</span><small>{command.description}</small></button>)}</div>}
-                  <textarea value={input} onChange={(event) => setInput(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void sendMessage(); } }} placeholder="Écris un message à Lucy…" rows={2} />
+                <div className="composer-shortcuts"><span>ENTER POUR ENVOYER · CTRL / ⌘ K POUR REVENIR AU CHAT</span><span>{busy ? "GÉNÉRATION EN COURS" : `${currentProvider?.name.toUpperCase() ?? "MODÈLE NON CONNECTÉ"} // ${modelId || "CHOISIR UN MODÈLE"}`}</span></div>
+                <div className={`composer ${busy ? "composer-generating" : ""} ${input.trim() ? "is-writing" : ""}`}>
+                  {commandSuggestions.length > 0 && <div className="command-suggestions" id="command-suggestions" role="listbox" aria-label="Commandes locales">{commandSuggestions.map((command, index) => <button key={command.name} id={`command-option-${command.name}`} type="button" role="option" aria-selected={index === commandSuggestionIndex} className={index === commandSuggestionIndex ? "selected" : ""} onMouseEnter={() => setCommandSuggestionIndex(index)} onClick={() => { setInput(`/${command.name} `); setCommandSuggestionIndex(0); composerInput.current?.focus(); }}><span>/{command.name}</span><small>{command.description}</small></button>)}</div>}
+                  <textarea
+                    ref={composerInput}
+                    id="chat-composer"
+                    value={input}
+                    aria-label="Message à Lucy"
+                    aria-keyshortcuts="Control+K Meta+K"
+                    aria-autocomplete="list"
+                    aria-controls={commandSuggestions.length > 0 ? "command-suggestions" : undefined}
+                    aria-expanded={commandSuggestions.length > 0}
+                    aria-activedescendant={commandSuggestions.length > 0 ? `command-option-${commandSuggestions[commandSuggestionIndex]?.name}` : undefined}
+                    onChange={(event) => { setInput(event.target.value); setCommandSuggestionIndex(0); }}
+                    onKeyDown={(event) => {
+                      if (commandSuggestions.length > 0 && (event.key === "ArrowDown" || event.key === "ArrowUp")) {
+                        event.preventDefault();
+                        const direction = event.key === "ArrowDown" ? 1 : -1;
+                        setCommandSuggestionIndex((index) => (index + direction + commandSuggestions.length) % commandSuggestions.length);
+                      } else if (event.key === "Escape" && commandSuggestions.length > 0) {
+                        event.preventDefault();
+                        event.stopPropagation();
+                        setInput("");
+                      } else if (event.key === "Enter" && !event.shiftKey) {
+                        event.preventDefault();
+                        const exactCommand = commandSuggestions.find((command) => input.trim() === `/${command.name}`);
+                        if (exactCommand || commandSuggestions.length === 0) {
+                          void sendMessage();
+                        } else {
+                          setInput(`/${commandSuggestions[commandSuggestionIndex]?.name ?? commandSuggestions[0].name} `);
+                          setCommandSuggestionIndex(0);
+                          composerInput.current?.focus();
+                        }
+                      }
+                    }}
+                    placeholder="Écris un message à Lucy… · ⌘K pour revenir ici"
+                    rows={2}
+                  />
                   <div className="composer-bottom">
                     <select className="composer-select model-select" value={`${providerId}::${modelId}`} aria-label="Modèle d’IA" disabled={busy || appState.providers.length === 0} onChange={(event) => void selectModel(event.target.value)}>
                       {appState.providers.flatMap((provider) => provider.models.map((model) =>
@@ -1262,6 +1404,7 @@ function App() {
                       <option value="discussion">DISCUSSION</option>
                     </select>
                     <span className="composer-hint">SHIFT + ENTER POUR UNE NOUVELLE LIGNE</span>
+                    {input.trim() && <span className="typing-indicator" aria-label="Saisie en cours"><i /><i /><i /><i /></span>}
                     {contextUsage && <div className="context-meter-wrap">
                       <button
                         className={`context-meter ${contextPercent >= 85 ? "context-meter-high" : ""}`}
@@ -1298,7 +1441,7 @@ function App() {
           <div className="inspector-tabs">
             {(["files", "sessions", "mcp"] as const).map((tab) => <button key={tab} className={activePanel === tab ? "active" : ""} onClick={() => setActivePanel(tab)}>{tab === "files" ? "FICHIERS" : tab === "sessions" ? "STATS" : "MCP"}</button>)}
           </div>
-          {activePanel === "files" && <div className="inspector-content"><div className="panel-title"><span>EXPLORATEUR LOCAL</span><button onClick={() => void refreshExplorer().catch((reason: unknown) => setError(friendlyError(reason)))}>↻</button></div><div className="current-path" title={filePath}>{filePath.replace(projectPath, "~") || "~"}</div>
+          {activePanel === "files" && <div className="inspector-content"><div className="panel-title"><span>EXPLORATEUR LOCAL</span><button aria-label="Actualiser l’explorateur de fichiers" onClick={() => void refreshExplorer().catch((reason: unknown) => setError(friendlyError(reason)))}>↻</button></div><div className="current-path" title={filePath}>{filePath.replace(projectPath, "~") || "~"}</div>
             {fileContent ? <div className="file-preview"><button onClick={() => setFileContent("")}>← RETOUR</button><pre>{fileContent}</pre></div> : <div className="file-tree">{filePath !== projectPath && <button className="parent-folder" onClick={() => { const parent = filePath.split("/").slice(0, -1).join("/") || projectPath; void invoke<FileItem[]>("list_project_files", { projectPath, requestedPath: parent }).then((items) => { setFiles(items); setFilePath(parent); setError(""); }).catch((reason: unknown) => setError(friendlyError(reason))); }}>‹ DOSSIER PARENT</button>}{files.map((file) => <button key={file.path} className="file-row" onClick={() => void loadFile(file)}><span>{file.type === "directory" ? "▸" : "·"}</span>{file.name}</button>)}</div>}
             <button className="utility-button" onClick={() => setShowCommand(true)}>$_ TERMINAL (CONFIRMATION REQUISE)</button>
           </div>}
@@ -1335,7 +1478,7 @@ function App() {
 
       {showProvider && <div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) setShowProvider(false); }}>
         <div className="modal-card">
-          <div className="modal-kicker">CONNEXIONS // CONFIGURATION LOCALE</div><button className="modal-close" onClick={() => setShowProvider(false)}>×</button><h2>Choisir ton modèle.</h2>
+          <div className="modal-kicker">CONNEXIONS // CONFIGURATION LOCALE</div><button className="modal-close" aria-label="Fermer les fournisseurs et modèles" onClick={() => setShowProvider(false)}>×</button><h2>Choisir ton modèle.</h2>
           <p>Importe tes clés API OpenCode ou connecte une API compatible OpenAI — notamment Ollama, sans connexion cloud.</p>
           <button className="primary-button modal-submit" disabled={busy} onClick={() => void importProviders()}>{busy ? "IMPORT EN COURS…" : "↻ IMPORTER AUTOMATIQUEMENT LES COMPTES EXISTANTS"}</button>
           {appState.providers.map((provider) => <div className="provider-card" key={provider.id}><div><strong>{provider.name}</strong><small>{provider.baseUrl} · {provider.models.length} modèle(s) · {provider.source === "opencode-free" ? "gratuit via OpenCode local · outils activés selon le mode" : provider.source === "oauth" ? "OAuth importé" : provider.source === "import" ? "importé depuis OpenCode" : "configuré localement"}</small>{provider.modelsError && <small className="provider-error">{provider.modelsError}</small>}</div><div className="provider-actions"><button onClick={() => { setProviderId(provider.id); void refreshModels(provider.id); }}>MODÈLES ↻</button><button className="remove-provider" onClick={() => void deleteProvider(provider.id)}>×</button></div></div>)}
@@ -1352,7 +1495,7 @@ function App() {
 
       {showSkills && <div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) setShowSkills(false); }}>
         <div className="modal-card skills-modal">
-          <div className="modal-kicker">CLAUDE CODE // SKILLS DU PROJET</div><button className="modal-close" onClick={() => setShowSkills(false)}>×</button><h2>Skills du projet.</h2>
+          <div className="modal-kicker">CLAUDE CODE // SKILLS DU PROJET</div><button className="modal-close" aria-label="Fermer les skills" onClick={() => setShowSkills(false)}>×</button><h2>Skills du projet.</h2>
           <p>Les skills suivent le format Claude Code dans <code>.claude/skills/&lt;nom&gt;/SKILL.md</code>. LUCY charge leurs instructions pour chaque modèle connecté.</p>
           <div className="skills-list">
             {skills.map((skill) => <div className="skill-card" key={skill.name}>
@@ -1374,7 +1517,7 @@ function App() {
 
       {showCommand && <div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) setShowCommand(false); }}>
         <form className="modal-card command-modal" onSubmit={(event) => void executeShell(event)}>
-          <div className="modal-kicker">SHELL // EXÉCUTION LOCALE</div><button type="button" className="modal-close" onClick={() => setShowCommand(false)}>×</button><h2>Commande système.</h2>
+          <div className="modal-kicker">SHELL // EXÉCUTION LOCALE</div><button type="button" className="modal-close" aria-label="Fermer le terminal" onClick={() => setShowCommand(false)}>×</button><h2>Commande système.</h2>
           <p>Vérifie la commande avant de la confirmer. Elle sera exécutée dans le répertoire de ton projet.</p>
           <label className="field-label">RÉPERTOIRE DE TRAVAIL</label><code className="workspace-path">{projectPath}</code>
           <label className="field-label">COMMANDE</label><input autoFocus value={shellCommand} onChange={(event) => setShellCommand(event.target.value)} placeholder="git status" required />
