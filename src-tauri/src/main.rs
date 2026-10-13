@@ -2790,7 +2790,7 @@ async fn run_opencode_model(
             reqwest::Method::POST,
             &format!("/api/session/{id}/model"),
             Some(serde_json::json!({
-                "model": { "providerID": "opencode", "modelID": model_id }
+                "model": { "providerID": "opencode", "id": model_id }
             })),
         )
         .await;
@@ -2824,7 +2824,7 @@ async fn run_opencode_model(
             Some(serde_json::json!({
                 "title": format!("LUCY · {}", session.title),
                 "agent": agent,
-                "model": { "providerID": "opencode", "modelID": model_id },
+                "model": { "providerID": "opencode", "id": model_id },
                 "location": { "directory": session.project_path },
             })),
         )
