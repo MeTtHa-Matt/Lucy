@@ -44,6 +44,12 @@ type ToolApproval = {
   toolName: string;
   arguments: Record<string, unknown>;
 };
+type UserQuestion = {
+  id: string;
+  sessionId: string;
+  question: string;
+  options: string[];
+};
 type ContextUsage = {
   modelId: string;
   usedTokens: number;
@@ -133,6 +139,8 @@ function App() {
   const [showCommand, setShowCommand] = useState(false);
   const [shellCommand, setShellCommand] = useState("");
   const [pendingApproval, setPendingApproval] = useState<ToolApproval | null>(null);
+  const [pendingQuestion, setPendingQuestion] = useState<UserQuestion | null>(null);
+  const [questionAnswer, setQuestionAnswer] = useState("");
   const [liveTimeline, setLiveTimeline] = useState<TimelineSegment[]>([]);
   const [projectContext, setProjectContext] = useState<ProjectContext | null>(null);
   const [contextLoading, setContextLoading] = useState(false);
@@ -230,6 +238,7 @@ function App() {
       streamComplete.current = false;
       setBusy(false);
       setContextLoading(false);
+      setPendingQuestion(null);
       void syncState().then(() => {
         setDraftMessage(null);
         setDraftAnswer(null);
@@ -465,6 +474,7 @@ function App() {
         setBusy(false);
         setContextLoading(false);
         setPendingApproval(null);
+        setPendingQuestion(null);
         void syncState().then(() => {
           setDraftMessage(null);
           setDraftAnswer(null);
@@ -510,6 +520,17 @@ function App() {
     }).then((dispose) => { unlisten = dispose; });
     return () => unlisten?.();
   }, []);
+
+  useEffect(() => {
+    if (!isTauri()) return;
+    let unlisten: (() => void) | undefined;
+    void listen<UserQuestion>("user:question", (event) => {
+      if (event.payload.sessionId !== sessionId) return;
+      setPendingQuestion(event.payload);
+      setQuestionAnswer("");
+    }).then((dispose) => { unlisten = dispose; });
+    return () => unlisten?.();
+  }, [sessionId]);
 
   useEffect(() => {
     if (!projectPath) return;
@@ -644,6 +665,8 @@ function App() {
     setLiveTimeline([]);
     setProjectContext(null);
     setContextLoading(false);
+    setPendingQuestion(null);
+    setQuestionAnswer("");
     setError("");
   };
 
@@ -1007,6 +1030,22 @@ function App() {
     }
   };
 
+  const submitQuestionAnswer = async (event: React.FormEvent) => {
+    event.preventDefault();
+    if (!pendingQuestion || !questionAnswer.trim()) return;
+    try {
+      await invoke("answer_user_question", {
+        questionId: pendingQuestion.id,
+        answer: questionAnswer.trim(),
+      });
+      setPendingQuestion(null);
+      setQuestionAnswer("");
+      setError("");
+    } catch (reason) {
+      setError(friendlyError(reason));
+    }
+  };
+
   const changeMode = async (nextMode: "build" | "plan" | "discussion") => {
     setMode(nextMode);
     if (sessionId) {
@@ -1191,11 +1230,16 @@ function App() {
                       : <div className="message-body user-message-clickable" onClick={(event) => openMessageMenu(message, event)} onContextMenu={(event) => openMessageMenu(message, event)}>{message.text}</div>
                     : message.segments.map((segment, index) => segment.kind === "text"
                       ? <div key={`${segment.id}-${index}`} className="message-body">{segment.text}</div>
-                      : <details key={segment.tool.id} className={`tool-activity ${segment.tool.result !== undefined ? "complete" : ""}`} open>
-                        <summary><span>{segment.tool.result !== undefined ? "✓" : "◌"}</span>{segment.tool.name}</summary>
-                        <pre>{segment.tool.name === "run_shell" ? String(segment.tool.arguments.command ?? "") : JSON.stringify(segment.tool.arguments, null, 2)}</pre>
-                        {segment.tool.result?.trim() && <pre className="tool-result">{segment.tool.result}</pre>}
-                      </details>)}
+                      : segment.tool.name === "report_progress"
+                        ? <aside key={segment.tool.id} className="reasoning-summary">
+                          <span>RAISONNEMENT SYNTHÉTIQUE</span>
+                          <p>{String(segment.tool.arguments.summary ?? "")}</p>
+                        </aside>
+                        : <details key={segment.tool.id} className={`tool-activity ${segment.tool.result !== undefined ? "complete" : ""}`} open>
+                          <summary><span>{segment.tool.result !== undefined ? "✓" : "◌"}</span>{segment.tool.name === "ask_user" ? "Question posée" : segment.tool.name}</summary>
+                          <pre>{segment.tool.name === "run_shell" ? String(segment.tool.arguments.command ?? "") : JSON.stringify(segment.tool.arguments, null, 2)}</pre>
+                          {segment.tool.result?.trim() && <pre className="tool-result">{segment.tool.result}</pre>}
+                        </details>)}
                   {message.role !== "user" && busy && message.id === draftAnswer?.id && message.segments.length === 0 && <div className="thinking"><span className="pulse" /> {contextCompacting ? "LUCY CONDENSE LE CONTEXTE…" : "LUCY RÉPOND…"}</div>}
                 </article>)}
               </div>
@@ -1354,6 +1398,28 @@ function App() {
           </div>
           <span className="modal-foot">L’AUTORISATION DE SESSION RESTE ACTIVE UNIQUEMENT POUR CETTE CONVERSATION.</span>
         </section>
+      </div>}
+
+      {pendingQuestion && <div className="modal-backdrop approval-backdrop">
+        <form className="modal-card question-modal" onSubmit={(event) => void submitQuestionAnswer(event)} role="dialog" aria-modal="true" aria-labelledby="question-title">
+          <div className="modal-kicker">PRÉCISION // LUCY A BESOIN DE TON AVIS</div>
+          <h2 id="question-title">{pendingQuestion.question}</h2>
+          <p>Ta réponse permettra à Lucy de poursuivre sans faire de suppositions.</p>
+          {pendingQuestion.options.length > 0 && <div className="question-options">
+            {pendingQuestion.options.map((option) => <button
+              key={option}
+              type="button"
+              className={questionAnswer === option ? "selected" : ""}
+              onClick={() => setQuestionAnswer(option)}
+            >{option}</button>)}
+          </div>}
+          <label className="field-label" htmlFor="question-answer">{pendingQuestion.options.length > 0 ? "CHOISIS OU ÉCRIS TA RÉPONSE" : "TA RÉPONSE"}</label>
+          <textarea id="question-answer" autoFocus value={questionAnswer} onChange={(event) => setQuestionAnswer(event.target.value)} maxLength={2_000} rows={3} required />
+          <div className="modal-actions">
+            <button className="reject-button" type="button" onClick={() => void stopGeneration()}>ARRÊTER</button>
+            <button className="approve-button" type="submit" disabled={!questionAnswer.trim()}>RÉPONDRE ET CONTINUER ↗</button>
+          </div>
+        </form>
       </div>}
     </main>
   );

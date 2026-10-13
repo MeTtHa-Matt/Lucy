@@ -970,6 +970,27 @@ button:disabled {
 }
 .tool-activity .tool-result { color: #b5cdb2; }
 
+.reasoning-summary {
+  margin: 12px 0 12px 31px;
+  padding: 9px 12px;
+  border-left: 2px solid #72505b;
+  background: rgba(25, 20, 24, 0.72);
+  color: #b9aab1;
+}
+
+.reasoning-summary span {
+  color: #c18d9a;
+  font: 8px var(--mono);
+  letter-spacing: 0.08em;
+}
+
+.reasoning-summary p {
+  margin: 5px 0 0;
+  font-size: 11px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+}
+
 .user-message .message-body {
   margin-left: 31px;
   padding: 11px 13px;
@@ -1226,6 +1247,48 @@ details.tool-card summary {
 
 .approval-modal {
   width: min(620px, calc(100vw - 36px));
+}
+
+.question-modal {
+  width: min(560px, calc(100vw - 36px));
+}
+
+.question-modal textarea {
+  width: 100%;
+  min-height: 76px;
+  padding: 10px 11px;
+  resize: vertical;
+  border: 1px solid #3d3036;
+  outline: none;
+  background: #0b090c;
+  color: #eee5e9;
+  font: 12px/1.6 var(--sans);
+}
+
+.question-modal textarea:focus {
+  border-color: #a72c44;
+}
+
+.question-options {
+  display: grid;
+  gap: 6px;
+  margin: 12px 0;
+}
+
+.question-options button {
+  padding: 9px 11px;
+  border: 1px solid #45343b;
+  background: #100e11;
+  color: #cfc3c9;
+  font: 10px var(--mono);
+  text-align: left;
+}
+
+.question-options button:hover,
+.question-options button.selected {
+  border-color: #b63851;
+  background: #351521;
+  color: #ff9cab;
 }
 
 .approval-details {

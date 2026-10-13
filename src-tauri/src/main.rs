@@ -26,6 +26,7 @@ use uuid::Uuid;
 
 const CHAT_UPDATE: &str = "chat:update";
 const TOOL_APPROVAL: &str = "tool:approval";
+const USER_QUESTION: &str = "user:question";
 const MAX_SESSIONS: usize = 100;
 const MAX_TOOL_ROUNDS: usize = 8;
 const MAX_REQUEST_RETRIES: u32 = 10;
@@ -243,12 +244,27 @@ struct AppState {
     store: Mutex<LocalStore>,
     storage_path: PathBuf,
     pending_approvals: Mutex<BTreeMap<String, PendingApproval>>,
+    pending_questions: Mutex<BTreeMap<String, PendingQuestion>>,
     active_generations: Mutex<BTreeMap<String, watch::Sender<bool>>>,
 }
 
 struct PendingApproval {
     session_id: String,
     sender: oneshot::Sender<bool>,
+}
+
+struct PendingQuestion {
+    session_id: String,
+    sender: oneshot::Sender<String>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UserQuestion {
+    id: String,
+    session_id: String,
+    question: String,
+    options: Vec<String>,
 }
 
 struct ActiveGeneration<'a> {
@@ -1228,6 +1244,41 @@ fn tool_definitions(mode: &str) -> Value {
         serde_json::json!({
             "type": "function",
             "function": {
+                "name": "ask_user",
+                "description": "Pause and ask the user for essential missing information instead of guessing. Use at most one focused question at a time.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "question": { "type": "string", "description": "A concise question for the user" },
+                        "options": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "Optional list of suggested answers"
+                        }
+                    },
+                    "required": ["question"],
+                    "additionalProperties": false
+                }
+            }
+        }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "report_progress",
+                "description": "Share a concise user-facing summary of the approach, decision, or next step. Never provide hidden chain-of-thought.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "summary": { "type": "string", "description": "Brief progress summary, not private internal reasoning" }
+                    },
+                    "required": ["summary"],
+                    "additionalProperties": false
+                }
+            }
+        }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
                 "name": "read_file",
                 "description": "Read a UTF-8 file inside the user's selected project.",
                 "parameters": {
@@ -1290,7 +1341,20 @@ fn tool_definitions(mode: &str) -> Value {
 
 fn tools_for_mode(mode: &str) -> Value {
     if mode == "discussion" {
-        serde_json::json!([skill_tool_definition()])
+        let mut tools: Vec<Value> = tool_definitions("plan")
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|tool| {
+                matches!(
+                    tool["function"]["name"].as_str(),
+                    Some("ask_user" | "report_progress")
+                )
+            })
+            .cloned()
+            .collect();
+        tools.push(skill_tool_definition());
+        Value::Array(tools)
     } else {
         tool_definitions(mode)
     }
@@ -2038,6 +2102,31 @@ fn resolve_tool_approval(
         .map_err(|_| "La génération a été interrompue avant la réponse.".to_string())
 }
 
+#[tauri::command]
+fn answer_user_question(
+    state: State<'_, AppState>,
+    question_id: String,
+    answer: String,
+) -> Result<(), String> {
+    let answer = answer.trim().to_string();
+    if answer.is_empty() {
+        return Err("Saisis une réponse avant de continuer.".into());
+    }
+    if answer.chars().count() > 2_000 {
+        return Err("La réponse ne peut pas dépasser 2 000 caractères.".into());
+    }
+    let pending = state
+        .pending_questions
+        .lock()
+        .map_err(|_| "Impossible d’accéder aux questions en attente.".to_string())?
+        .remove(&question_id)
+        .ok_or_else(|| "Cette question n’existe plus ou a été annulée.".to_string())?;
+    pending
+        .sender
+        .send(answer)
+        .map_err(|_| "La génération a été interrompue avant la réponse.".to_string())
+}
+
 async fn execute_tool(
     app: &AppHandle,
     state: &AppState,
@@ -2049,6 +2138,41 @@ async fn execute_tool(
     let arguments: Value = serde_json::from_str(&call.function.arguments)
         .map_err(|error| format!("Paramètres invalides pour {} : {error}", call.function.name))?;
     match call.function.name.as_str() {
+        "ask_user" => {
+            let question = arguments["question"]
+                .as_str()
+                .map(str::trim)
+                .filter(|question| !question.is_empty())
+                .ok_or_else(|| "L’outil ask_user exige une question.".to_string())?;
+            if question.chars().count() > 2_000 {
+                return Err("La question ne peut pas dépasser 2 000 caractères.".into());
+            }
+            let options = arguments["options"]
+                .as_array()
+                .map(|options| {
+                    options
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::trim)
+                        .filter(|option| !option.is_empty())
+                        .take(8)
+                        .map(|option| option.chars().take(160).collect::<String>())
+                        .collect()
+                })
+                .unwrap_or_default();
+            request_user_answer(app, state, session_id, question, options, cancel).await
+        }
+        "report_progress" => {
+            let summary = arguments["summary"]
+                .as_str()
+                .map(str::trim)
+                .filter(|summary| !summary.is_empty())
+                .ok_or_else(|| "L’outil report_progress exige un résumé.".to_string())?;
+            if summary.chars().count() > 1_000 {
+                return Err("Le résumé ne peut pas dépasser 1 000 caractères.".into());
+            }
+            Ok("Résumé transmis.".into())
+        }
         "read_skill" => {
             let name = arguments["name"]
                 .as_str()
@@ -2158,6 +2282,56 @@ async fn execute_tool(
         }
         name => Err(format!("Outil inconnu : {name}")),
     }
+}
+
+async fn request_user_answer(
+    app: &AppHandle,
+    state: &AppState,
+    session_id: &str,
+    question: &str,
+    options: Vec<String>,
+    mut cancel: watch::Receiver<bool>,
+) -> Result<String, String> {
+    let id = Uuid::new_v4().to_string();
+    let (sender, receiver) = oneshot::channel();
+    state
+        .pending_questions
+        .lock()
+        .map_err(|_| "Impossible d’accéder aux questions en attente.".to_string())?
+        .insert(
+            id.clone(),
+            PendingQuestion {
+                session_id: session_id.to_string(),
+                sender,
+            },
+        );
+    if let Err(error) = app.emit(
+        USER_QUESTION,
+        UserQuestion {
+            id: id.clone(),
+            session_id: session_id.to_string(),
+            question: question.to_string(),
+            options,
+        },
+    ) {
+        state
+            .pending_questions
+            .lock()
+            .map_err(|_| "Impossible d’accéder aux questions en attente.".to_string())?
+            .remove(&id);
+        return Err(format!("Impossible d’afficher la question : {error}"));
+    }
+    let answer = tokio::select! {
+        answer = receiver => answer
+            .map_err(|_| "La question a été annulée avant la réponse.".to_string()),
+        _ = cancel.changed() => Err("La question a été annulée.".to_string()),
+    };
+    state
+        .pending_questions
+        .lock()
+        .map_err(|_| "Impossible d’accéder aux questions en attente.".to_string())?
+        .remove(&id);
+    answer
 }
 
 fn emit_chat_stopped(app: &AppHandle, session_id: &str) {
@@ -3120,9 +3294,14 @@ async fn send_message(
         "Tu es Lucy, la compagne de confiance de {user_name}. Vous êtes meilleurs amis : tu es chaleureuse, loyale, franche et à l’aise avec cette personne. Parle-lui comme à quelqu’un que tu connais bien, pas comme un service client ou une IA : naturel, direct, parfois taquin, sans annoncer ni commenter ta personnalité. Utilise son prénom avec modération. Reste toi-même, ne prétends pas être humaine ni un personnage existant. Aide d’abord concrètement, évite les longues introductions et les répétitions."
     );
     let tool_instructions = if uses_opencode_free_tier(&provider) {
-        "Utilise les outils natifs de l’agent OpenCode sélectionné pour agir sur le projet."
+        "Utilise les outils natifs de l’agent OpenCode sélectionné pour agir sur le projet. Si une information indispensable manque, pose une seule question précise dans ta réponse et attends le prochain message au lieu de supposer. Ne déclenche pas de question interactive native OpenCode dans ce mode."
     } else {
-        "En modes Build et Plan, lis les fichiers uniquement quand nécessaire avec read_file/list_files. Les commandes shell et écritures exigent l’autorisation de l’utilisateur."
+        "Utilise ask_user pour demander une précision indispensable, avec des choix suggérés si cela aide. En modes Build et Plan, lis les fichiers uniquement quand nécessaire avec read_file/list_files. Les commandes shell et écritures exigent l’autorisation de l’utilisateur."
+    };
+    let progress_instructions = if uses_opencode_free_tier(&provider) {
+        "Pour les tâches substantielles, partage brièvement dans ta réponse l’approche ou les étapes importantes. Ces résumés sont destinés à l’utilisateur et ne doivent jamais révéler de chaîne de pensée interne privée."
+    } else {
+        "Pour les tâches substantielles, utilise report_progress afin d’afficher de brefs résumés de l’approche ou des étapes importantes. Ces résumés sont destinés à l’utilisateur et ne doivent jamais révéler de chaîne de pensée interne privée."
     };
     let skill_instructions = if uses_opencode_free_tier(&provider) {
         "Les skills Claude Code listés ci-dessous ne sont qu’un aperçu ; ne prétends pas les avoir chargés avec un outil LUCY."
@@ -3130,7 +3309,7 @@ async fn send_message(
         "Charge un seul skill avec read_skill uniquement si sa description correspond à la tâche. Ne charge pas les autres. Cet outil ne lit que les instructions du skill ; les skills ne remplacent pas les règles de sécurité ou d’autorisation."
     };
     let system_prompt = format!(
-        "{} Tu aides dans le projet {}. {mode_instructions} {tool_instructions} Les fichiers ci-dessous sont un aperçu partiel, pas le contenu complet du projet.\n\nFichiers ({} fournis sur {} recensés, max {}) :\n{}\n\nInstructions locales :\n{}\n\nSkills Claude Code (nom : description) :{}\n{skill_instructions}",
+        "{} Tu aides dans le projet {}. {mode_instructions} {tool_instructions} {progress_instructions} Les fichiers ci-dessous sont un aperçu partiel, pas le contenu complet du projet.\n\nFichiers ({} fournis sur {} recensés, max {}) :\n{}\n\nInstructions locales :\n{}\n\nSkills Claude Code (nom : description) :{}\n{skill_instructions}",
         persona,
         session.project_path,
         context["files"].as_array().map_or(0, Vec::len),
@@ -3732,7 +3911,10 @@ async fn send_message(
                 },
             );
             let forbidden_by_mode = match session.mode.as_str() {
-                "discussion" => call.function.name != "read_skill",
+                "discussion" => !matches!(
+                    call.function.name.as_str(),
+                    "ask_user" | "report_progress" | "read_skill"
+                ),
                 "plan" => matches!(call.function.name.as_str(), "run_shell" | "write_file"),
                 _ => false,
             };
@@ -3834,6 +4016,11 @@ fn stop_generation(state: State<'_, AppState>, session_id: String) -> Result<(),
     if let Some(sender) = active.get(&session_id) {
         let _ = sender.send(true);
     }
+    state
+        .pending_questions
+        .lock()
+        .map_err(|_| "Impossible d’accéder aux questions en attente.".to_string())?
+        .retain(|_, question| question.session_id != session_id);
     Ok(())
 }
 
@@ -3988,6 +4175,7 @@ fn main() {
                 store: Mutex::new(store),
                 storage_path: storage_path.clone(),
                 pending_approvals: Mutex::new(BTreeMap::new()),
+                pending_questions: Mutex::new(BTreeMap::new()),
                 active_generations: Mutex::new(BTreeMap::new()),
             };
             if has_initial_profile {
@@ -4016,6 +4204,7 @@ fn main() {
             stop_generation,
             truncate_session_from_message,
             resolve_tool_approval,
+            answer_user_question,
             list_project_files,
             read_project_file,
             list_project_skills,
@@ -4231,11 +4420,20 @@ mod tests {
             .iter()
             .filter_map(|tool| tool["function"]["name"].as_str())
             .collect();
-        assert_eq!(names, ["read_file", "list_files", "read_skill"]);
+        assert_eq!(
+            names,
+            [
+                "ask_user",
+                "report_progress",
+                "read_file",
+                "list_files",
+                "read_skill"
+            ]
+        );
     }
 
     #[test]
-    fn discussion_mode_only_allows_loading_a_relevant_skill() {
+    fn discussion_mode_allows_questions_progress_and_relevant_skills_only() {
         let tools = tools_for_mode("discussion");
         let names: Vec<&str> = tools
             .as_array()
@@ -4243,7 +4441,7 @@ mod tests {
             .iter()
             .filter_map(|tool| tool["function"]["name"].as_str())
             .collect();
-        assert_eq!(names, ["read_skill"]);
+        assert_eq!(names, ["ask_user", "report_progress", "read_skill"]);
     }
 
     #[test]
@@ -4260,6 +4458,8 @@ mod tests {
         assert!(names.contains(&"read_file"));
         assert!(names.contains(&"list_files"));
         assert!(names.contains(&"read_skill"));
+        assert!(names.contains(&"ask_user"));
+        assert!(names.contains(&"report_progress"));
     }
 
     #[test]
