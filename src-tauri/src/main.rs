@@ -1109,6 +1109,7 @@ struct OpenCodeQuestion {
     options: Vec<String>,
 }
 
+#[cfg(test)]
 struct OpenCodeRunEvent {
     session_id: Option<String>,
     text: Option<String>,
@@ -1189,6 +1190,7 @@ fn append_opencode_text(timeline: &mut Vec<OpenCodeTimelineItem>, text: &str) {
     }
 }
 
+#[cfg(test)]
 fn parse_opencode_run_event(line: &str) -> Result<OpenCodeRunEvent, String> {
     let event: Value = serde_json::from_str(line)
         .map_err(|error| format!("Événement JSON OpenCode invalide : {error}"))?;
