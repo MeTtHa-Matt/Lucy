@@ -224,6 +224,7 @@ function TerminalToolActivity({ tool, animate }: { tool: ToolActivity; animate: 
       <summary>
         <span className="terminal-tool-led" />
         <span className="terminal-tool-name">{formatToolName(tool.name)}</span>
+        <span className="terminal-tool-id">{tool.name}</span>
         <span className="terminal-tool-state">{tool.result !== undefined ? "TERMINÉ" : inputComplete ? "EN COURS" : "PRÉPARATION"}</span>
       </summary>
       <pre className={`tool-input ${!inputComplete ? "tool-input-streaming" : ""}`}>
@@ -233,8 +234,8 @@ function TerminalToolActivity({ tool, animate }: { tool: ToolActivity; animate: 
       </pre>
       {tool.result !== undefined && (
         <div className="terminal-tool-output">
-          <div className="terminal-output-label"><span>↳</span> SORTIE</div>
-          <pre>{tool.result.trim() || "Commande terminée sans sortie."}</pre>
+          <div className="terminal-output-label"><span>↳</span> SORTIE DE L’OUTIL</div>
+          <pre>{tool.result.trim() || "Outil terminé sans sortie."}</pre>
         </div>
       )}
     </details>

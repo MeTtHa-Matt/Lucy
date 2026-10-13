@@ -3548,6 +3548,11 @@ summary,
   letter-spacing: 0.025em;
 }
 
+.terminal-tool-id {
+  color: #a9818b;
+  font-size: 9px;
+}
+
 .terminal-tool-state {
   color: #d77c8d;
   font-size: 9px;

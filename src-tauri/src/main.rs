@@ -2687,14 +2687,44 @@ fn opencode_tool_event_from_part(part: &Value) -> Option<OpenCodeToolEvent> {
         .as_str()
         .and_then(|input| serde_json::from_str(input).ok())
         .unwrap_or(arguments);
+    let result = opencode_tool_result(state);
+    Some(OpenCodeToolEvent {
+        id: id.to_string(),
+        name: name.to_string(),
+        arguments,
+        status: state["status"].as_str().unwrap_or("completed").to_string(),
+        result,
+    })
+}
+
+fn opencode_tool_result(state: &Value) -> String {
     let result = state["content"]
         .as_array()
         .into_iter()
         .flatten()
-        .filter_map(|content| content["text"].as_str())
+        .filter_map(|content| match content["type"].as_str() {
+            Some("text") => content["text"].as_str().map(str::to_string),
+            Some("file") => {
+                let mut details = Vec::new();
+                if let Some(name) = content["name"].as_str() {
+                    details.push(format!("Fichier : {name}"));
+                }
+                if let Some(mime) = content["mime"].as_str() {
+                    details.push(format!("Type : {mime}"));
+                }
+                if let Some(uri) = content["uri"]
+                    .as_str()
+                    .filter(|uri| !uri.starts_with("data:"))
+                {
+                    details.push(format!("Adresse : {uri}"));
+                }
+                (!details.is_empty()).then(|| details.join("\n"))
+            }
+            _ => None,
+        })
         .collect::<Vec<_>>()
         .join("\n");
-    let result = if result.is_empty() {
+    if result.is_empty() {
         state["error"]["message"]
             .as_str()
             .or_else(|| state["error"].as_str())
@@ -2703,14 +2733,7 @@ fn opencode_tool_event_from_part(part: &Value) -> Option<OpenCodeToolEvent> {
             .to_string()
     } else {
         result
-    };
-    Some(OpenCodeToolEvent {
-        id: id.to_string(),
-        name: name.to_string(),
-        arguments,
-        status: state["status"].as_str().unwrap_or("completed").to_string(),
-        result,
-    })
+    }
 }
 
 fn opencode_timeline_from_messages(
@@ -2767,6 +2790,63 @@ fn opencode_timeline_from_messages(
         }
     }
     (tools, timeline)
+}
+
+fn emit_opencode_tool_update(
+    app: &AppHandle,
+    session_id: &str,
+    tool: OpenCodeToolEvent,
+    tools: &mut Vec<OpenCodeToolEvent>,
+    timeline: &mut Vec<OpenCodeTimelineItem>,
+    started_tools: &mut std::collections::BTreeSet<String>,
+    completed_tools: &mut std::collections::BTreeSet<String>,
+) {
+    if let Some(previous) = tools.iter_mut().find(|previous| previous.id == tool.id) {
+        *previous = tool.clone();
+    } else {
+        tools.push(tool.clone());
+    }
+    if is_opencode_question_tool(&tool.name) {
+        return;
+    }
+
+    if started_tools.insert(tool.id.clone()) {
+        timeline.push(OpenCodeTimelineItem::Tool(tool.id.clone()));
+        let _ = app.emit(
+            CHAT_UPDATE,
+            ChatUpdate {
+                session_id: session_id.to_string(),
+                message_id: tool.id.clone(),
+                kind: "tool_start".into(),
+                delta: String::new(),
+                error: None,
+                details: Some(serde_json::json!({
+                    "name": tool.name,
+                    "arguments": tool.arguments,
+                })),
+            },
+        );
+    }
+    if !matches!(tool.status.as_str(), "running" | "pending" | "streaming")
+        && completed_tools.insert(tool.id.clone())
+    {
+        let result = if tool.result.is_empty() && tool.status == "error" {
+            "L’outil OpenCode a échoué.".to_string()
+        } else {
+            tool.result.chars().take(5_000).collect()
+        };
+        let _ = app.emit(
+            CHAT_UPDATE,
+            ChatUpdate {
+                session_id: session_id.to_string(),
+                message_id: tool.id,
+                kind: "tool_result".into(),
+                delta: String::new(),
+                error: None,
+                details: Some(serde_json::json!({ "result": result })),
+            },
+        );
+    }
 }
 
 fn opencode_text_delta(
@@ -3025,11 +3105,14 @@ async fn run_opencode_model(
     let mut tools: Vec<OpenCodeToolEvent> = Vec::new();
     let mut timeline = Vec::new();
     let mut started_tools = std::collections::BTreeSet::new();
+    let mut completed_tools = std::collections::BTreeSet::new();
     let mut seen_text_parts = BTreeMap::new();
     let mut line_buffer = Vec::new();
     let mut run_error = None;
     let mut session_idle = false;
     let mut generation_started = false;
+    let mut tool_poll = tokio::time::interval(Duration::from_millis(150));
+    tool_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
         if *cancel.borrow() {
@@ -3095,6 +3178,32 @@ async fn run_opencode_model(
                     None => {}
                 }
                 wait_task = None;
+            }
+            _ = tool_poll.tick() => {
+                if generation_started && !session_idle {
+                    // OpenCode may update tool parts in session history before the SSE subscriber receives them.
+                    if let Ok(messages) = opencode_api_json(
+                        &client,
+                        &base_url,
+                        &password,
+                        reqwest::Method::GET,
+                        &format!("/api/session/{session_id}/message?order=desc&limit=100"),
+                        None,
+                    ).await {
+                        let (polled_tools, _) = opencode_timeline_from_messages(&messages, started_at);
+                        for tool in polled_tools {
+                            emit_opencode_tool_update(
+                                app,
+                                &session.id,
+                                tool,
+                                &mut tools,
+                                &mut timeline,
+                                &mut started_tools,
+                                &mut completed_tools,
+                            );
+                        }
+                    }
+                }
             }
             chunk = event_stream.next() => {
                 let Some(chunk) = chunk else {
@@ -3313,42 +3422,15 @@ async fn run_opencode_model(
                     if event_type == "message.part.updated" {
                         let part = properties.get("part").unwrap_or(properties);
                         if let Some(tool) = opencode_tool_event_from_part(part) {
-                            if let Some(previous) = tools.iter_mut().find(|previous| previous.id == tool.id) {
-                                *previous = tool.clone();
-                            } else {
-                                tools.push(tool.clone());
-                            }
-                            if started_tools.insert(tool.id.clone()) && !is_opencode_question_tool(&tool.name) {
-                                timeline.push(OpenCodeTimelineItem::Tool(tool.id.clone()));
-                                let _ = app.emit(CHAT_UPDATE, ChatUpdate {
-                                    session_id: session.id.clone(),
-                                    message_id: tool.id.clone(),
-                                    kind: "tool_start".into(),
-                                    delta: String::new(),
-                                    error: None,
-                                    details: Some(serde_json::json!({
-                                        "name": tool.name,
-                                        "arguments": tool.arguments,
-                                    })),
-                                });
-                            }
-                            if !is_opencode_question_tool(&tool.name)
-                                && !matches!(tool.status.as_str(), "running" | "pending" | "streaming")
-                            {
-                                let result = if tool.result.is_empty() && tool.status == "error" {
-                                    "L’outil OpenCode a échoué.".to_string()
-                                } else {
-                                    tool.result.chars().take(5_000).collect()
-                                };
-                                let _ = app.emit(CHAT_UPDATE, ChatUpdate {
-                                    session_id: session.id.clone(),
-                                    message_id: tool.id,
-                                    kind: "tool_result".into(),
-                                    delta: String::new(),
-                                    error: None,
-                                    details: Some(serde_json::json!({ "result": result })),
-                                });
-                            }
+                            emit_opencode_tool_update(
+                                app,
+                                &session.id,
+                                tool,
+                                &mut tools,
+                                &mut timeline,
+                                &mut started_tools,
+                                &mut completed_tools,
+                            );
                         }
                     }
                 }
@@ -5843,6 +5925,30 @@ mod tests {
         assert_eq!(tool.name, "question");
         assert_eq!(tool.arguments["questions"][0]["question"], "Continuer ?");
         assert_eq!(tool.result, "done");
+    }
+
+    #[test]
+    fn preserves_metadata_for_opencode_file_tool_results_without_exposing_data_uris() {
+        let result = opencode_tool_result(&serde_json::json!({
+            "content": [
+                {
+                    "type": "file",
+                    "name": "capture.png",
+                    "mime": "image/png",
+                    "uri": "file:///project/capture.png"
+                },
+                {
+                    "type": "file",
+                    "mime": "image/png",
+                    "uri": "data:image/png;base64,secret-payload"
+                }
+            ]
+        }));
+
+        assert!(result.contains("Fichier : capture.png"));
+        assert!(result.contains("Type : image/png"));
+        assert!(result.contains("Adresse : file:///project/capture.png"));
+        assert!(!result.contains("secret-payload"));
     }
 
     #[test]
