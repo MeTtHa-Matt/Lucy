@@ -34,9 +34,7 @@ type TimelineSegment =
   | { kind: "text"; id: string; text: string }
   | { kind: "tool"; tool: ToolActivity };
 type StreamedEvent =
-  | { kind: "word"; id: string; text: string }
-  | { kind: "tool_start"; tool: ToolActivity }
-  | { kind: "tool_result"; id: string; result: string };
+  | { kind: "word"; id: string; text: string };
 type ProjectContext = { projectPath: string; files: string[]; instructions: string; truncated: boolean };
 type ProjectSkill = { name: string; description: string };
 type ToolApproval = {
@@ -173,6 +171,51 @@ const formatToolArguments = (tool: ToolActivity) => {
   }).join("\n\n");
 };
 
+function TerminalToolActivity({ tool, animate }: { tool: ToolActivity; animate: boolean }) {
+  const fullInput = formatToolArguments(tool);
+  const [visibleCharacters, setVisibleCharacters] = useState(0);
+  const characters = useMemo(() => Array.from(fullInput), [fullInput]);
+  const displayedCharacters = animate ? visibleCharacters : characters.length;
+  const inputComplete = displayedCharacters >= characters.length;
+
+  useEffect(() => {
+    setVisibleCharacters(animate ? 0 : characters.length);
+    if (!animate || characters.length === 0) return;
+    if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
+      setVisibleCharacters(characters.length);
+      return;
+    }
+    let written = 0;
+    const timer = window.setInterval(() => {
+      written = Math.min(characters.length, written + 3);
+      setVisibleCharacters(written);
+      if (written >= characters.length) window.clearInterval(timer);
+    }, 18);
+    return () => window.clearInterval(timer);
+  }, [animate, characters]);
+
+  return (
+    <details className={`tool-activity terminal-tool ${tool.result !== undefined ? "complete" : "running"}`} open>
+      <summary>
+        <span className="terminal-tool-led" />
+        <span className="terminal-tool-name">{formatToolName(tool.name)}</span>
+        <span className="terminal-tool-state">{tool.result !== undefined ? "TERMINÉ" : inputComplete ? "EN COURS" : "PRÉPARATION"}</span>
+      </summary>
+      <pre className={`tool-input ${!inputComplete ? "tool-input-streaming" : ""}`}>
+        <span className="terminal-tool-prompt" aria-hidden="true">❯ </span>
+        {characters.slice(0, displayedCharacters).join("")}
+        {!inputComplete && <span className="terminal-tool-cursor" aria-hidden="true">▌</span>}
+      </pre>
+      {tool.result !== undefined && (
+        <div className="terminal-tool-output">
+          <div className="terminal-output-label"><span>↳</span> SORTIE</div>
+          <pre>{tool.result.trim() || "Commande terminée sans sortie."}</pre>
+        </div>
+      )}
+    </details>
+  );
+}
+
 const friendlyError = (error: unknown) => error instanceof Error ? error.message : String(error);
 
 function App() {
@@ -230,6 +273,7 @@ function App() {
   const initialChatFocusApplied = useRef(false);
   const messageMenuRef = useRef<HTMLDivElement>(null);
   const stickToChatBottom = useRef(true);
+  const touchStartY = useRef<number | null>(null);
   const streamedEvents = useRef<StreamedEvent[]>([]);
   const incompleteWord = useRef("");
   const lastStreamMessageId = useRef("");
@@ -364,18 +408,6 @@ function App() {
           }
           return [...segments, { kind: "text", id: nextEvent.id, text: nextEvent.text }];
         });
-        return;
-      }
-      if (nextEvent?.kind === "tool_start") {
-        setLiveTimeline((segments) => [...segments, { kind: "tool", tool: nextEvent.tool }]);
-        return;
-      }
-      if (nextEvent?.kind === "tool_result") {
-        setLiveTimeline((segments) => segments.map((segment) =>
-          segment.kind === "tool" && segment.tool.id === nextEvent.id
-            ? { ...segment, tool: { ...segment.tool, result: nextEvent.result } }
-            : segment,
-        ));
         return;
       }
       if (!streamComplete.current || streamedEvents.current.length > 0) return;
@@ -558,20 +590,25 @@ function App() {
       } else if (update.kind === "compacted") {
         setContextCompacting(false);
       } else if (update.kind === "tool_start") {
-        streamedEvents.current.push({
-          kind: "tool_start",
-          tool: {
+        setLiveTimeline((segments) => {
+          if (segments.some((segment) => segment.kind === "tool" && segment.tool.id === update.messageId)) {
+            return segments;
+          }
+          return [...segments, {
+            kind: "tool" as const,
+            tool: {
             id: update.messageId,
             name: String(update.details?.name ?? "outil"),
             arguments: (update.details?.arguments as Record<string, unknown>) ?? {},
-          },
+            },
+          }];
         });
       } else if (update.kind === "tool_result") {
-        streamedEvents.current.push({
-          kind: "tool_result",
-          id: update.messageId,
-          result: String(update.details?.result ?? ""),
-        });
+        setLiveTimeline((segments) => segments.map((segment) =>
+          segment.kind === "tool" && segment.tool.id === update.messageId
+            ? { ...segment, tool: { ...segment.tool, result: String(update.details?.result ?? "") } }
+            : segment,
+        ));
         void refreshExplorer().catch((reason: unknown) => setError(friendlyError(reason)));
       } else if (update.kind === "delta") {
         setContextCompacting(false);
@@ -987,6 +1024,7 @@ function App() {
   const sendMessage = async (messageText?: string) => {
     const text = (messageText ?? input).trim();
     if (!text || busy || !sessionId) return;
+    stickToChatBottom.current = true;
     setError("");
     setRetryStatus(null);
     setNotice("");
@@ -1445,9 +1483,30 @@ function App() {
               <div
                 ref={chatScroll}
                 className={`chat-scroll ${busy ? "is-generating" : ""}`}
+                onWheel={(event) => {
+                  if (event.deltaY < 0) stickToChatBottom.current = false;
+                }}
+                onTouchStart={(event) => {
+                  touchStartY.current = event.touches[0]?.clientY ?? null;
+                }}
+                onTouchMove={(event) => {
+                  const currentY = event.touches[0]?.clientY;
+                  if (currentY !== undefined && touchStartY.current !== null && currentY > touchStartY.current) {
+                    stickToChatBottom.current = false;
+                  }
+                  touchStartY.current = currentY ?? null;
+                }}
+                onTouchEnd={() => { touchStartY.current = null; }}
+                onKeyDown={(event) => {
+                  if (["ArrowUp", "PageUp", "Home"].includes(event.key)) {
+                    stickToChatBottom.current = false;
+                  }
+                }}
                 onScroll={(event) => {
                   const element = event.currentTarget;
-                  stickToChatBottom.current = element.scrollHeight - element.scrollTop - element.clientHeight <= 64;
+                  if (element.scrollHeight - element.scrollTop - element.clientHeight <= 64) {
+                    stickToChatBottom.current = true;
+                  }
                 }}
               >
                 <div ref={chatContent}>
@@ -1472,27 +1531,21 @@ function App() {
                       : <div className="message-body user-message-clickable" tabIndex={0} aria-haspopup="dialog" aria-label="Actions sur ce message" onClick={(event) => openMessageMenu(message, event)} onContextMenu={(event) => openMessageMenu(message, event)} onKeyDown={(event) => { if (event.key === "Enter" || event.key === " " || (event.shiftKey && event.key === "F10")) { event.preventDefault(); openMessageMenu(message, event); } }}>{message.text}</div>
                     : message.segments.map((segment, index) => segment.kind === "text"
                       ? <div key={`${segment.id}-${index}`} className={`message-body ${busy && segment.id === lastStreamMessageId.current ? "streaming-text" : ""}`}><div className="markdown-body"><Suspense fallback={<span className="markdown-loading">{segment.text}</span>}><MarkdownResponse>{segment.text}</MarkdownResponse></Suspense></div></div>
-                      : segment.tool.name === "report_progress"
-                        ? <aside key={segment.tool.id} className="reasoning-summary">
-                          <span>RAISONNEMENT SYNTHÉTIQUE</span>
-                          <p>{String(segment.tool.arguments.summary ?? "")}</p>
-                        </aside>
-                        : <details key={segment.tool.id} className={`tool-activity ${segment.tool.result !== undefined ? "complete" : ""}`} open>
-                          <summary><span>{segment.tool.result !== undefined ? "✓" : "◌"}</span>{formatToolName(segment.tool.name)}</summary>
-                          <pre>{formatToolArguments(segment.tool)}</pre>
-                          {segment.tool.result?.trim() && <pre className="tool-result">{segment.tool.result}</pre>}
-                        </details>)}
+                      : <TerminalToolActivity
+                        key={segment.tool.id}
+                        tool={segment.tool}
+                        animate={busy && message.id === draftAnswer?.id}
+                      />)}
                   {message.role !== "user" && busy && message.id === draftAnswer?.id && message.segments.length === 0 && <div className="thinking"><span className="pulse" /> {contextCompacting ? "LUCY CONDENSE LE CONTEXTE…" : "LUCY PRÉPARE SA RÉPONSE…"}<span className="thinking-wave" aria-hidden="true"><i /><i /><i /><i /></span></div>}
                 </article>)}
                 </div>
               </div>
               <div className="composer-wrap">
-                <div className="composer-shortcuts"><span>ENTER POUR ENVOYER · CTRL / ⌘ K POUR REVENIR AU CHAT</span><span>{busy ? "GÉNÉRATION EN COURS" : `${currentProvider?.name.toUpperCase() ?? "MODÈLE NON CONNECTÉ"} // ${modelId || "CHOISIR UN MODÈLE"}`}</span></div>
                 <div className={`composer ${busy ? "composer-generating" : ""} ${input.trim() ? "is-writing" : ""}`}>
                   {commandSuggestions.length > 0 && <div className="command-suggestions" id="command-suggestions" role="listbox" aria-label="Commandes locales">{commandSuggestions.map((command, index) => <button key={command.name} id={`command-option-${command.name}`} type="button" role="option" aria-selected={index === commandSuggestionIndex} className={index === commandSuggestionIndex ? "selected" : ""} onMouseEnter={() => setCommandSuggestionIndex(index)} onClick={() => { setInput(`/${command.name} `); setCommandSuggestionIndex(0); composerInput.current?.focus(); }}><span>/{command.name}</span><small>{command.description}</small></button>)}</div>}
                   <div className="terminal-header" aria-hidden="true">
-                    <span className="terminal-status"><i />LUCY <b>›</b> CHAT</span>
-                    <span>{busy ? "STREAM ACTIF" : "ENTRÉE LOCALE"}</span>
+                    <span className="terminal-status"><i />LUCY <b>/</b> TERMINAL</span>
+                    <span>{busy ? "● GÉNÉRATION EN COURS" : "● SESSION LOCALE"}</span>
                   </div>
                   <div className="terminal-input-line">
                     <span className="terminal-prompt" aria-hidden="true">❯</span>
@@ -1589,6 +1642,10 @@ function App() {
                       : <button className="send-button" onClick={() => void sendMessage()} disabled={!input.trim()}>ENVOYER ↗</button>}
                   </div>
                   {!appState.providers.length && <button className="connect-inline" onClick={() => setShowProvider(true)}>＋ CONNECTER UN MODÈLE</button>}
+                  <div className="terminal-footer">
+                    <span><kbd>ENTER</kbd> ENVOYER <i /> <kbd>SHIFT</kbd> + <kbd>ENTER</kbd> NOUVELLE LIGNE</span>
+                    <span>{currentProvider?.name.toUpperCase() ?? "AUCUN FOURNISSEUR"} <i /> {modelId || "CHOISIR UN MODÈLE"} <i /> CTRL / ⌘ K FOCUS</span>
+                  </div>
                 </div>
               </div>
             </>

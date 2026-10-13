@@ -65,7 +65,7 @@ Les identifiants LUCY sont stockés dans son dossier de configuration local avec
 - Persona LUCY cohérente, concise et familière, indépendante du fournisseur et du modèle sélectionné. Le prénom renseigné à l’installation est inclus dans les instructions système et n’est pas modifiable depuis l’interface.
 - Lecture de fichiers et exploration du projet ; les chemins restent limités au dossier de travail, et les dossiers d’identifiants et fichiers de secrets sont exclus.
 - Pour les fournisseurs gérés directement par LUCY, l’écriture de fichiers et les commandes shell demandent une confirmation ponctuelle, avec option d’autorisation pour toute la session. Les commandes sont limitées à 60 secondes et leur sortie à 20 000 caractères. Les outils natifs d’OpenCode Zen utilisent les permissions configurées dans OpenCode.
-- Les appels d’outils, leurs arguments, leurs résultats et le texte du modèle sont affichés dans l’ordre de la conversation, y compris pendant l’exécution, et restent visibles dans l’historique. L’explorateur de fichiers se rafraîchit après les actions d’outil.
+- Tous les appels d’outils sont présentés dans des panneaux au style terminal ; leurs arguments se dévoilent en flux pendant l’exécution et leurs résultats apparaissent dès leur réception. Les appels, résultats et réponses restent dans l’ordre de la conversation et dans l’historique. L’explorateur de fichiers se rafraîchit après les actions d’outil.
 - Le chat conserve le défilement en bas uniquement si l’utilisateur s’y trouvait déjà.
 - Explorateur de fichiers, aperçu de fichiers et commandes locales `/help`, `/clear` (effacer l’affichage sans supprimer l’historique), `/skill` ou `/skills` (gestion des skills Claude Code du projet) et `/terminal`.
 
