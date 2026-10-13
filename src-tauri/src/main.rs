@@ -1190,6 +1190,16 @@ fn append_opencode_text(timeline: &mut Vec<OpenCodeTimelineItem>, text: &str) {
     }
 }
 
+fn append_opencode_fallback_text(timeline: &mut Vec<OpenCodeTimelineItem>, answer: &str) {
+    if !answer.trim().is_empty()
+        && !timeline
+            .iter()
+            .any(|item| matches!(item, OpenCodeTimelineItem::Text(_)))
+    {
+        timeline.push(OpenCodeTimelineItem::Text(answer.to_string()));
+    }
+}
+
 #[cfg(test)]
 fn parse_opencode_run_event(line: &str) -> Result<OpenCodeRunEvent, String> {
     let event: Value = serde_json::from_str(line)
@@ -4105,9 +4115,10 @@ async fn send_message(
         let mut opencode_timeline = Vec::new();
         let mut question_rounds = 0;
         loop {
-            let Some((_answer, opencode_session_id, run_tools, run_timeline)) = run else {
+            let Some((answer, opencode_session_id, run_tools, mut run_timeline)) = run else {
                 return Ok(());
             };
+            append_opencode_fallback_text(&mut run_timeline, &answer);
             if let Some(opencode_session_id) = opencode_session_id {
                 let mut store = state
                     .store
@@ -5753,6 +5764,22 @@ mod tests {
             &timeline[2],
             OpenCodeTimelineItem::Text(text) if text == "C’est terminé."
         ));
+    }
+
+    #[test]
+    fn adds_recovered_opencode_text_to_the_persisted_timeline() {
+        let mut timeline = vec![OpenCodeTimelineItem::Tool("call-1".into())];
+        append_opencode_fallback_text(&mut timeline, "Réponse récupérée");
+        assert!(matches!(
+            timeline.last(),
+            Some(OpenCodeTimelineItem::Text(text)) if text == "Réponse récupérée"
+        ));
+        append_opencode_fallback_text(&mut timeline, "Réponse récupérée");
+        assert_eq!(timeline.len(), 2);
+
+        let mut streamed = vec![OpenCodeTimelineItem::Text("Déjà reçu".into())];
+        append_opencode_fallback_text(&mut streamed, "Réponse récupérée");
+        assert_eq!(streamed.len(), 1);
     }
 
     #[test]
