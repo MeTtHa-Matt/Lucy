@@ -29,6 +29,7 @@ const TOOL_APPROVAL: &str = "tool:approval";
 const USER_QUESTION: &str = "user:question";
 const MAX_SESSIONS: usize = 100;
 const MAX_TOOL_ROUNDS: usize = 8;
+const MAX_RESPONSE_CONTINUATIONS: usize = 2;
 const MAX_REQUEST_RETRIES: u32 = 10;
 const MAX_RETRY_DELAY_SECONDS: u64 = 300;
 const MAX_CONTEXT_FILES: usize = 80;
@@ -3294,9 +3295,9 @@ async fn send_message(
         "Tu es Lucy, la compagne de confiance de {user_name}. Vous êtes meilleurs amis : tu es chaleureuse, loyale, franche et à l’aise avec cette personne. Parle-lui comme à quelqu’un que tu connais bien, pas comme un service client ou une IA : naturel, direct, parfois taquin, sans annoncer ni commenter ta personnalité. Utilise son prénom avec modération. Reste toi-même, ne prétends pas être humaine ni un personnage existant. Aide d’abord concrètement, évite les longues introductions et les répétitions."
     );
     let tool_instructions = if uses_opencode_free_tier(&provider) {
-        "Utilise les outils natifs de l’agent OpenCode sélectionné pour agir sur le projet. Si une information indispensable manque, pose une seule question précise dans ta réponse et attends le prochain message au lieu de supposer. Ne déclenche pas de question interactive native OpenCode dans ce mode."
+        "Utilise les outils natifs de l’agent OpenCode sélectionné pour agir sur le projet. Pour inspecter ou modifier réellement des fichiers ou lancer une commande, appelle l’outil correspondant au lieu d’imprimer une commande ou un bloc de code comme substitut. N’affiche des commandes à copier que si l’utilisateur demande explicitement une commande à exécuter lui-même. Si une information indispensable manque, pose une seule question précise dans ta réponse et attends le prochain message au lieu de supposer. Ne déclenche pas de question interactive native OpenCode dans ce mode."
     } else {
-        "Utilise ask_user pour demander une précision indispensable, avec des choix suggérés si cela aide. En modes Build et Plan, lis les fichiers uniquement quand nécessaire avec read_file/list_files. Les commandes shell et écritures exigent l’autorisation de l’utilisateur."
+        "Utilise ask_user pour demander une précision indispensable, avec des choix suggérés si cela aide. Pour inspecter ou modifier réellement des fichiers ou lancer une commande, appelle l’outil correspondant au lieu d’imprimer une commande ou un bloc de code comme substitut. N’affiche des commandes à copier que si l’utilisateur demande explicitement une commande à exécuter lui-même. En modes Build et Plan, lis les fichiers uniquement quand nécessaire avec read_file/list_files. En mode Build, utilise run_shell pour exécuter les commandes ; les commandes shell et écritures exigent l’autorisation de l’utilisateur."
     };
     let progress_instructions = if uses_opencode_free_tier(&provider) {
         "Pour les tâches substantielles, partage brièvement dans ta réponse l’approche ou les étapes importantes. Ces résumés sont destinés à l’utilisateur et ne doivent jamais révéler de chaîne de pensée interne privée."
@@ -3469,14 +3470,22 @@ async fn send_message(
             Err(error) => return Err(error),
         }
     }
-    let mut final_answer = String::new();
-    for round in 0..=MAX_TOOL_ROUNDS {
+    let final_answer;
+    let mut tool_rounds = 0;
+    let mut continuations = 0;
+    loop {
         let assistant_id = Uuid::new_v4().to_string();
-        let chat_messages = chat_messages_for_request(
+        let mut chat_messages = chat_messages_for_request(
             &system_prompt,
             session.context_summary.as_deref(),
             &chat_history,
         );
+        if continuations > 0 {
+            chat_messages.push(serde_json::json!({
+                "role": "user",
+                "content": "La réponse précédente a été interrompue par la limite de sortie du modèle. Reprends directement à la suite, sans répéter ce qui a déjà été dit."
+            }));
+        }
         let url = format!(
             "{}/chat/completions",
             provider.base_url.trim_end_matches('/')
@@ -3486,7 +3495,7 @@ async fn send_message(
             "messages": chat_messages,
             "stream": true,
         });
-        if round < MAX_TOOL_ROUNDS {
+        if tool_rounds < MAX_TOOL_ROUNDS {
             payload["tools"] = tools_for_mode(&session.mode);
             payload["tool_choice"] = Value::String("auto".into());
         }
@@ -3662,6 +3671,7 @@ async fn send_message(
         let mut answer = String::new();
         let mut tool_calls: BTreeMap<usize, StreamedToolCall> = BTreeMap::new();
         let mut provider_metadata = Map::new();
+        let mut finish_reason = None;
         let mut stream_error = None;
         'stream: loop {
             let next_chunk = tokio::select! {
@@ -3714,6 +3724,9 @@ async fn send_message(
                     break 'stream;
                 }
                 let delta = &payload["choices"][0]["delta"];
+                if let Some(reason) = payload["choices"][0]["finish_reason"].as_str() {
+                    finish_reason = Some(reason.to_string());
+                }
                 merge_provider_metadata(&mut provider_metadata, delta);
                 if let Some(text_delta) = delta["content"].as_str() {
                     answer.push_str(text_delta);
@@ -3786,6 +3799,48 @@ async fn send_message(
             emit_chat_error(&app, &session_id, &assistant_id, &error);
             return Err(error);
         }
+        if finish_reason.as_deref() == Some("length") && tool_calls.is_empty() {
+            if answer.is_empty() {
+                let error = format!(
+                    "Le modèle {} a atteint sa limite de sortie avant de fournir une réponse textuelle.",
+                    provider.name
+                );
+                emit_chat_error(&app, &session_id, &assistant_id, &error);
+                return Err(error);
+            }
+            let partial = ChatMessage {
+                id: assistant_id.clone(),
+                role: "assistant".into(),
+                text: answer,
+                created_at: now_millis(),
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+                provider_metadata,
+            };
+            chat_history.push(partial.clone());
+            append_session_message(&state, &session_id, partial)?;
+            if continuations >= MAX_RESPONSE_CONTINUATIONS {
+                let error = format!(
+                    "La réponse de {} a été interrompue après {} reprises automatiques : le modèle atteint sa limite de sortie.",
+                    provider.name, MAX_RESPONSE_CONTINUATIONS
+                );
+                emit_chat_error(&app, &session_id, &assistant_id, &error);
+                return Err(error);
+            }
+            continuations += 1;
+            let _ = app.emit(
+                CHAT_UPDATE,
+                ChatUpdate {
+                    session_id: session_id.clone(),
+                    message_id: assistant_id,
+                    kind: "round".into(),
+                    delta: String::new(),
+                    error: None,
+                    details: None,
+                },
+            );
+            continue;
+        }
         if tool_calls.is_empty() {
             if answer.is_empty() {
                 let error = format!(
@@ -3849,7 +3904,7 @@ async fn send_message(
                 }
             }
         }
-        if round == MAX_TOOL_ROUNDS {
+        if tool_rounds == MAX_TOOL_ROUNDS {
             let error = format!(
                 "Le modèle a demandé d’autres outils après la limite de {MAX_TOOL_ROUNDS} tours."
             );
@@ -3985,6 +4040,7 @@ async fn send_message(
             };
             append_session_message(&state, &session_id, persisted_tool_message)?;
         }
+        tool_rounds += 1;
     }
     if final_answer.is_empty() {
         let error = format!(
