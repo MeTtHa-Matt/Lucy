@@ -100,6 +100,14 @@ const localCommands = [
   { name: "skills", description: "Gérer les skills Claude Code du projet" },
   { name: "terminal", description: "Ouvrir un terminal local avec confirmation" },
 ];
+const commandPaletteActions = [
+  { label: "Changer de session", description: "Afficher les conversations enregistrées", shortcut: "↵" },
+  { label: "Sélectionner un modèle", description: "Choisir parmi les modèles disponibles", shortcut: "↵" },
+  { label: "Nouvelle session", description: "Créer une conversation", shortcut: "↵" },
+  { label: "Supprimer la session", description: "Supprimer la conversation active", shortcut: "↵" },
+  { label: "Fermer l’application", description: "Quitter LUCY", shortcut: "↵" },
+  { label: "Fermer le menu", description: "Retourner à la conversation", shortcut: "Échap" },
+];
 
 const toolNameLabels: Record<string, string> = {
   ask_user: "Question à l’utilisateur",
@@ -250,6 +258,8 @@ function App() {
   const [fileContent, setFileContent] = useState("");
   const [showProvider, setShowProvider] = useState(false);
   const [showSkills, setShowSkills] = useState(false);
+  const [commandPalette, setCommandPalette] = useState<"main" | "sessions" | "models" | null>(null);
+  const [commandPaletteIndex, setCommandPaletteIndex] = useState(0);
   const [skills, setSkills] = useState<ProjectSkill[]>([]);
   const [skillsBusy, setSkillsBusy] = useState(false);
   const [skillForm, setSkillForm] = useState({ name: "", description: "", instructions: "" });
@@ -289,6 +299,13 @@ function App() {
     ? Math.min(100, Math.round(contextUsage.usedTokens * 100 / contextUsage.limitTokens))
     : 0;
   const currentProvider = appState.providers.find((provider) => provider.id === providerId);
+  const paletteModels = useMemo(() => appState.providers.flatMap((provider) =>
+    provider.models.map((model) => ({
+      providerId: provider.id,
+      modelId: model,
+      label: `${provider.name} / ${model}`,
+    })),
+  ), [appState.providers]);
   const visibleSessions = useMemo(
     () => appState.sessions.filter((session) => session.title.toLowerCase().includes(search.toLowerCase())),
     [appState.sessions, search],
@@ -300,7 +317,7 @@ function App() {
   const commandSuggestions = input.startsWith("/")
     ? localCommands.filter((command) => command.name.startsWith(input.slice(1).split(/\s+/)[0].toLowerCase())).slice(0, 5)
     : [];
-  const modalOpen = Boolean(showProvider || showSkills || showCommand || pendingApproval || pendingQuestion || messageMenu);
+  const modalOpen = Boolean(showProvider || showSkills || showCommand || pendingApproval || pendingQuestion || messageMenu || commandPalette);
 
   const scrollChatToBottom = useCallback(() => {
     const container = chatScroll.current;
@@ -1203,7 +1220,11 @@ function App() {
     if (!ready || modalOpen) return;
     const onShortcut = (event: KeyboardEvent) => {
       const modifier = event.metaKey || event.ctrlKey;
-      if (modifier && !event.shiftKey && event.key.toLowerCase() === "k") {
+      if (modifier && !event.shiftKey && event.key.toLowerCase() === "p") {
+        event.preventDefault();
+        setCommandPalette("main");
+        setCommandPaletteIndex(0);
+      } else if (modifier && !event.shiftKey && event.key.toLowerCase() === "k") {
         event.preventDefault();
         composerInput.current?.focus();
       } else if (modifier && event.shiftKey && event.key.toLowerCase() === "n") {
@@ -1218,7 +1239,7 @@ function App() {
   useEffect(() => {
     if (!modalOpen) return;
     const modal = document.querySelector<HTMLElement>(
-      ".modal-backdrop .modal-card, .message-menu-backdrop .message-context-menu",
+      ".modal-backdrop .modal-card, .message-menu-backdrop .message-context-menu, .command-palette",
     );
     if (!modal) return;
     const focusable = () => Array.from(modal.querySelectorAll<HTMLElement>(
@@ -1356,6 +1377,85 @@ function App() {
       setError(friendlyError(reason));
     }
   };
+
+  const activateCommandPaletteItem = (index: number) => {
+    if (commandPalette === "main") {
+      if (index === 0) {
+        setCommandPalette("sessions");
+        setCommandPaletteIndex(0);
+      } else if (index === 1) {
+        setCommandPalette("models");
+        setCommandPaletteIndex(0);
+      } else if (index === 2) {
+        setCommandPalette(null);
+        void createSession();
+      } else if (index === 3) {
+        setCommandPalette(null);
+        if (currentSession) void removeSession(currentSession);
+        else setError("Aucune session active à supprimer.");
+      } else if (index === 4) {
+        setCommandPalette(null);
+        if (windowControls) {
+          void windowControls.close().catch((reason: unknown) => setError(friendlyError(reason)));
+        } else {
+          setError("La fermeture de l’application nécessite l’application de bureau.");
+        }
+      } else if (index === 5) {
+        setCommandPalette(null);
+      }
+      return;
+    }
+
+    if (commandPalette === "sessions") {
+      const session = appState.sessions[index];
+      if (!session) return;
+      selectSession(session.id);
+      setCommandPalette(null);
+    } else if (commandPalette === "models") {
+      const model = paletteModels[index];
+      if (!model) return;
+      void selectModel(`${model.providerId}::${model.modelId}`);
+      setCommandPalette(null);
+    }
+  };
+
+  useEffect(() => {
+    if (!commandPalette) return;
+    const itemCount = commandPalette === "main"
+      ? commandPaletteActions.length
+      : commandPalette === "sessions" ? appState.sessions.length : paletteModels.length;
+    const onCommandPaletteKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        event.stopPropagation();
+        if (commandPalette === "main") setCommandPalette(null);
+        else {
+          setCommandPalette("main");
+          setCommandPaletteIndex(commandPalette === "sessions" ? 0 : 1);
+        }
+      } else if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+        event.preventDefault();
+        event.stopPropagation();
+        if (itemCount > 0) {
+          const direction = event.key === "ArrowDown" ? 1 : -1;
+          setCommandPaletteIndex((index) => (index + direction + itemCount) % itemCount);
+        }
+      } else if (event.key === "Enter") {
+        event.preventDefault();
+        event.stopPropagation();
+        activateCommandPaletteItem(commandPaletteIndex);
+      }
+    };
+    window.addEventListener("keydown", onCommandPaletteKeyDown);
+    return () => window.removeEventListener("keydown", onCommandPaletteKeyDown);
+  }, [commandPalette, commandPaletteIndex, appState.sessions, paletteModels]);
+
+  useEffect(() => {
+    if (!commandPalette) return;
+    const selected = document.querySelector<HTMLElement>(".command-palette-option.selected");
+    selected?.focus({ preventScroll: true });
+    selected?.scrollIntoView({ block: "nearest" });
+  }, [commandPalette, commandPaletteIndex, appState.sessions.length, paletteModels.length]);
 
   const openSessionContextMenu = (event: React.MouseEvent, session: Session) => {
     event.preventDefault();
@@ -1584,7 +1684,9 @@ function App() {
                         tool={segment.tool}
                         animate={busy && message.id === draftAnswer?.id}
                       />)}
-                  {message.role !== "user" && busy && message.id === draftAnswer?.id && message.segments.length === 0 && <div className="thinking"><span className="pulse" /> {contextCompacting ? "LUCY CONDENSE LE CONTEXTE…" : "LUCY PRÉPARE SA RÉPONSE…"}<span className="thinking-wave" aria-hidden="true"><i /><i /><i /><i /></span></div>}
+                  {message.role !== "user" && busy && message.id === draftAnswer?.id && message.segments.length === 0 && <div className="thinking" role="status" aria-label={contextCompacting ? "Lucy condense le contexte" : "Lucy réfléchit"}>
+                    <span className="typing-dots" aria-hidden="true"><i /><i /><i /></span>
+                  </div>}
                 </article>)}
                 </div>
               </div>
@@ -1592,7 +1694,7 @@ function App() {
                 <div className={`composer ${busy ? "composer-generating" : ""} ${input.trim() ? "is-writing" : ""}`}>
                   {commandSuggestions.length > 0 && <div className="command-suggestions" id="command-suggestions" role="listbox" aria-label="Commandes locales">{commandSuggestions.map((command, index) => <button key={command.name} id={`command-option-${command.name}`} type="button" role="option" aria-selected={index === commandSuggestionIndex} className={index === commandSuggestionIndex ? "selected" : ""} onMouseEnter={() => setCommandSuggestionIndex(index)} onClick={() => { setInput(`/${command.name} `); setCommandSuggestionIndex(0); composerInput.current?.focus(); }}><span>/{command.name}</span><small>{command.description}</small></button>)}</div>}
                   <div className="terminal-header" aria-hidden="true">
-                    <span className="terminal-status"><i />LUCY <b>/</b> TERMINAL</span>
+                    <span className="terminal-status"><i />LUCY</span>
                     <span>{busy ? "● GÉNÉRATION EN COURS" : "● SESSION LOCALE"}</span>
                   </div>
                   <div className="terminal-input-line">
@@ -1638,7 +1740,7 @@ function App() {
                             return;
                           }
                         }}
-                        placeholder="Écris ta requête… (Maj+Entrée pour une nouvelle ligne)"
+                        placeholder="Écris ta requête…"
                         rows={2}
                       />
                       <span
@@ -1662,7 +1764,6 @@ function App() {
                       <option value="plan">PLAN</option>
                       <option value="discussion">DISCUSSION</option>
                     </select>
-                    <span className="composer-hint">SHIFT + ENTER POUR UNE NOUVELLE LIGNE</span>
                     {input.trim() && <span className="typing-indicator" aria-label="Saisie en cours"><i /><i /><i /><i /></span>}
                     {contextUsage && <div className="context-meter-wrap">
                       <button
@@ -1691,8 +1792,8 @@ function App() {
                   </div>
                   {!appState.providers.length && <button className="connect-inline" onClick={() => setShowProvider(true)}>＋ CONNECTER UN MODÈLE</button>}
                   <div className="terminal-footer">
-                    <span><kbd>ENTER</kbd> ENVOYER <i /> <kbd>SHIFT</kbd> + <kbd>ENTER</kbd> NOUVELLE LIGNE</span>
-                    <span>{currentProvider?.name.toUpperCase() ?? "AUCUN FOURNISSEUR"} <i /> {modelId || "CHOISIR UN MODÈLE"} <i /> CTRL / ⌘ K FOCUS</span>
+                    <span><kbd>ENTER</kbd> ENVOYER</span>
+                    <span>{currentProvider?.name.toUpperCase() ?? "AUCUN FOURNISSEUR"} <i /> {modelId || "CHOISIR UN MODÈLE"}</span>
                   </div>
                 </div>
               </div>
@@ -1715,6 +1816,67 @@ function App() {
       </section>
 
       <footer className="statusbar"><div><span className={`status-dot ${ready ? "online" : ""}`} />{ready ? "MOTEUR AUTONOME ACTIF" : "INITIALISATION…"}</div><div className="status-right"><span>{appState.providers.length} FOURNISSEUR{appState.providers.length === 1 ? "" : "S"}</span><span>IDENTIFIANTS LOCAUX</span><span>v0.2.0</span></div></footer>
+
+      {commandPalette && <div className="command-palette-backdrop" onMouseDown={(event) => {
+        if (event.target === event.currentTarget) setCommandPalette(null);
+      }}>
+        <section className="command-palette" role="dialog" aria-modal="true" aria-label="Navigation LUCY" tabIndex={-1}>
+          <header className="command-palette-header">
+            <div>
+              <span className="command-palette-kicker">LUCY // NAVIGATION</span>
+              <h2>{commandPalette === "main" ? "Que veux-tu faire ?" : commandPalette === "sessions" ? "Changer de session" : "Sélectionner un modèle"}</h2>
+            </div>
+            {commandPalette !== "main" && <button type="button" className="command-palette-back" onClick={() => {
+              setCommandPalette("main");
+              setCommandPaletteIndex(commandPalette === "sessions" ? 0 : 1);
+            }}>← RETOUR</button>}
+          </header>
+          <div className={`command-palette-list ${commandPalette !== "main" ? "is-scrollable" : ""}`} role="listbox" aria-label={commandPalette === "main" ? "Actions disponibles" : commandPalette === "sessions" ? "Sessions disponibles" : "Modèles disponibles"}>
+            {commandPalette === "main" && commandPaletteActions.map((action, index) => <button
+              key={action.label}
+              type="button"
+              role="option"
+              aria-selected={commandPaletteIndex === index}
+              className={`command-palette-option ${commandPaletteIndex === index ? "selected" : ""}`}
+              onMouseEnter={() => setCommandPaletteIndex(index)}
+              onClick={() => activateCommandPaletteItem(index)}
+            >
+              <span className="command-palette-option-index">{String(index + 1).padStart(2, "0")}</span>
+              <span className="command-palette-option-copy"><strong>{action.label}</strong><small>{action.description}</small></span>
+              <kbd>{action.shortcut}</kbd>
+            </button>)}
+            {commandPalette === "sessions" && appState.sessions.map((session, index) => <button
+              key={session.id}
+              type="button"
+              role="option"
+              aria-selected={commandPaletteIndex === index}
+              className={`command-palette-option ${commandPaletteIndex === index ? "selected" : ""}`}
+              onMouseEnter={() => setCommandPaletteIndex(index)}
+              onClick={() => activateCommandPaletteItem(index)}
+            >
+              <span className="command-palette-option-index">{session.id === sessionId ? "●" : "○"}</span>
+              <span className="command-palette-option-copy"><strong>{session.title}</strong><small>{session.projectPath}</small></span>
+              <kbd>{new Date(session.updatedAt).toLocaleDateString("fr-FR")}</kbd>
+            </button>)}
+            {commandPalette === "sessions" && appState.sessions.length === 0 && <p className="command-palette-empty">Aucune session enregistrée.</p>}
+            {commandPalette === "models" && paletteModels.map((model, index) => <button
+              key={`${model.providerId}::${model.modelId}`}
+              type="button"
+              role="option"
+              aria-selected={commandPaletteIndex === index}
+              className={`command-palette-option ${commandPaletteIndex === index ? "selected" : ""}`}
+              onMouseEnter={() => setCommandPaletteIndex(index)}
+              onClick={() => activateCommandPaletteItem(index)}
+            >
+              <span className="command-palette-option-index">{model.providerId === providerId && model.modelId === modelId ? "●" : "○"}</span>
+              <span className="command-palette-option-copy"><strong>{model.label}</strong><small>{model.providerId}</small></span>
+              <kbd>↵</kbd>
+            </button>)}
+            {commandPalette === "models" && paletteModels.length === 0 && <p className="command-palette-empty">Aucun modèle disponible. Connecte ou actualise un fournisseur.</p>}
+          </div>
+          <footer className="command-palette-footer"><span><kbd>↑</kbd><kbd>↓</kbd> NAVIGUER</span><span><kbd>ENTER</kbd> VALIDER</span><span><kbd>ESC</kbd> FERMER / RETOUR</span></footer>
+        </section>
+      </div>}
 
       {sessionContextMenu && contextMenuSession && <div className="session-context-backdrop" onMouseDown={(event) => {
         if (event.target === event.currentTarget) setSessionContextMenu(null);
