@@ -2644,6 +2644,16 @@ async fn opencode_api_json(
         .map_err(|error| format!("Réponse JSON OpenCode invalide : {error}"))
 }
 
+fn opencode_session_id(response: &Value) -> Result<String, String> {
+    response
+        .get("data")
+        .and_then(|data| data["id"].as_str())
+        .or_else(|| response["id"].as_str())
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| "OpenCode a créé une session sans renvoyer son identifiant.".into())
+}
+
 async fn run_opencode_model(
     app: &AppHandle,
     state: &AppState,
@@ -2830,14 +2840,7 @@ async fn run_opencode_model(
         )
         .await
         .map_err(OpenCodeRunFailure::new)?;
-        created["id"]
-            .as_str()
-            .ok_or_else(|| {
-                OpenCodeRunFailure::new(
-                    "OpenCode a créé une session sans renvoyer son identifiant.".into(),
-                )
-            })?
-            .to_string()
+        opencode_session_id(&created).map_err(OpenCodeRunFailure::new)?
     };
 
     let prompt_client = client.clone();
@@ -5516,6 +5519,19 @@ mod tests {
         let encoded = serde_json::to_string(&wrapped.to_string()).unwrap();
         let decoded = parse_opencode_api_event(&encoded).unwrap();
         assert_eq!(decoded, direct);
+    }
+
+    #[test]
+    fn extracts_session_id_from_opencode_api_response_envelope() {
+        assert_eq!(
+            opencode_session_id(&serde_json::json!({ "data": { "id": "ses_nested" } })).unwrap(),
+            "ses_nested"
+        );
+        assert_eq!(
+            opencode_session_id(&serde_json::json!({ "id": "ses_legacy" })).unwrap(),
+            "ses_legacy"
+        );
+        assert!(opencode_session_id(&serde_json::json!({ "data": {} })).is_err());
     }
 
     #[test]
