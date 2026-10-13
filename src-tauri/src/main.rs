@@ -3183,6 +3183,31 @@ fn delete_chat_session(
 }
 
 #[tauri::command]
+fn rename_chat_session(
+    state: State<'_, AppState>,
+    session_id: String,
+    title: String,
+) -> Result<PublicState, String> {
+    let title = title.trim();
+    if title.is_empty() {
+        return Err("Le nom d’une session ne peut pas être vide.".into());
+    }
+    let mut store = state
+        .store
+        .lock()
+        .map_err(|_| "Impossible d’accéder aux données LUCY.".to_string())?;
+    let session = store
+        .sessions
+        .iter_mut()
+        .find(|session| session.id == session_id)
+        .ok_or_else(|| "La session n’existe plus.".to_string())?;
+    session.title = title.to_string();
+    session.updated_at = now_millis();
+    save_store(&state, &store)?;
+    Ok(public_state(&store))
+}
+
+#[tauri::command]
 async fn send_message(
     app: AppHandle,
     state: State<'_, AppState>,
@@ -4336,6 +4361,7 @@ fn main() {
             refresh_provider_models,
             create_chat_session,
             delete_chat_session,
+            rename_chat_session,
             send_message,
             stop_generation,
             truncate_session_from_message,

@@ -230,7 +230,7 @@ button:disabled {
   display: flex;
   align-items: center;
   gap: 10.8px;
-  padding: 0 12px;
+  padding: 8px 14px;
   border: 1.2px solid #3b2028;
   background: rgba(185, 25, 51, 0.09);
   color: #fa7184;
@@ -284,7 +284,7 @@ button:disabled {
   align-items: center;
   gap: 9.6px;
   height: 38.4px;
-  padding: 0 9.6px;
+  padding: 8px 12px;
   border: 1.2px solid #252126;
   background: #100e11;
   color: #766c72;
@@ -310,6 +310,8 @@ button:disabled {
   gap: 3.6px;
   overflow: auto;
   margin-top: 12px;
+  padding-right: 4.8px;
+  scrollbar-gutter: stable;
 }
 
 .session-row {
@@ -354,15 +356,19 @@ button:disabled {
 }
 
 .session-delete {
-  display: none;
+  flex: 0 0 33.6px;
+  display: block;
   width: 33.6px;
   border: 0;
   background: transparent;
   color: #9c6670;
+  opacity: 0;
+  pointer-events: none;
 }
 
 .session-row:hover .session-delete {
-  display: block;
+  opacity: 1;
+  pointer-events: auto;
 }
 
 .session-delete:hover {
@@ -1043,6 +1049,81 @@ button:disabled {
   backdrop-filter: blur(3.6px);
 }
 
+.session-context-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 120;
+  background: transparent;
+}
+
+.session-context-menu {
+  position: fixed;
+  width: 180px;
+  padding: 6px;
+  border: 1px solid #563342;
+  border-radius: 10px;
+  background: linear-gradient(145deg, rgba(28, 20, 28, 0.99), rgba(13, 11, 15, 0.99));
+  box-shadow: 0 16px 42px rgba(0, 0, 0, 0.62), 0 0 24px rgba(176, 43, 74, 0.13);
+  backdrop-filter: blur(18px);
+  animation: modal-arrive 120ms ease-out both;
+}
+
+.session-context-heading {
+  padding: 7px 9px 8px;
+  border-bottom: 1px solid #342630;
+  color: #907d87;
+  font: 8px var(--mono);
+  letter-spacing: 0.14em;
+}
+
+.session-context-menu button {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  width: 100%;
+  min-height: 34px;
+  margin-top: 3px;
+  padding: 7px 9px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+  color: #d5c8cf;
+  font: 10px var(--mono);
+  text-align: left;
+}
+
+.session-context-menu button > span {
+  width: 14px;
+  color: #d36b80;
+  font-size: 13px;
+  text-align: center;
+}
+
+.session-context-menu button:hover {
+  border-color: #583041;
+  background: linear-gradient(90deg, rgba(112, 39, 64, 0.38), rgba(40, 24, 34, 0.62));
+  color: #fff;
+}
+
+.session-context-divider {
+  height: 1px;
+  margin: 5px 4px 2px;
+  background: #30232b;
+}
+
+.session-context-menu button.danger {
+  color: #f08b99;
+}
+
+.session-context-menu button.danger > span {
+  color: #ff687f;
+}
+
+.session-context-menu button.danger:hover {
+  border-color: #773144;
+  background: rgba(128, 31, 54, 0.34);
+}
+
 .message-context-menu {
   width: min(432px, 100%);
   padding: 12px;
@@ -1682,32 +1763,132 @@ details.tool-card summary {
 .file-tree {
   display: flex;
   flex-direction: column;
-  gap: 1.2px;
-  margin: 12px -4.8px;
+  gap: 3.6px;
+  margin: 10.8px 0;
+  padding: 8.4px;
+  border: 1.2px solid #282129;
+  border-radius: var(--radius-sm);
+  background: linear-gradient(150deg, rgba(39, 24, 34, 0.58), rgba(17, 14, 19, 0.88));
 }
 
 .file-row {
   overflow: hidden;
   display: flex;
-  gap: 8.4px;
-  padding: 7.2px 6px;
-  border: 0;
-  background: transparent;
+  align-items: center;
+  gap: 9.6px;
+  min-height: 36px;
+  width: 100%;
+  padding: 7.2px 9.6px;
+  border: 1px solid transparent;
+  background: rgba(255, 255, 255, 0.012);
   color: #b9afb5;
   font-family: var(--mono);
   font-size: 10.8px;
   text-align: left;
+}
+
+.file-row-icon {
+  flex: 0 0 16px;
+  color: #a77787;
+  font-size: 15px;
+  text-align: center;
+}
+
+.file-row.directory .file-row-icon {
+  color: #f17a91;
+}
+
+.file-row-name {
+  overflow: hidden;
+  flex: 1;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.file-row span {
-  color: #f15b74;
+.file-row-chevron {
+  color: #79636e;
+  font-size: 14px;
 }
 
 .file-row:hover {
-  background: #1d151a;
+  border-color: #4b2c39;
+  background: linear-gradient(90deg, rgba(105, 34, 58, 0.34), rgba(37, 23, 32, 0.58));
   color: #fff;
+  box-shadow: inset 2px 0 #df506c;
+}
+
+.file-tree-empty {
+  margin: 8px 6px;
+  color: #81737c;
+  font-size: 11px;
+  line-height: 1.6;
+}
+
+.hidden-files-toggle {
+  display: flex;
+  align-items: center;
+  gap: 9.6px;
+  min-height: 40.8px;
+  margin: 10.8px 0;
+  padding: 8.4px 10.8px;
+  border: 1.2px solid #302630;
+  border-radius: var(--radius-sm);
+  background: linear-gradient(110deg, rgba(32, 22, 31, 0.9), rgba(17, 14, 19, 0.92));
+  color: #b4a6ae;
+  cursor: pointer;
+  font-family: var(--mono);
+  font-size: 9.6px;
+  letter-spacing: 0.035em;
+  transition: background-color 160ms ease, border-color 160ms ease, color 160ms ease;
+}
+
+.hidden-files-toggle:hover {
+  border-color: #754052;
+  color: #f0d9df;
+}
+
+.hidden-files-toggle input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  clip-path: inset(50%);
+}
+
+.hidden-files-check {
+  position: relative;
+  flex: 0 0 15px;
+  width: 15px;
+  height: 15px;
+  border: 1px solid #64505d;
+  border-radius: 3.6px;
+  background: #0c0a0d;
+  box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.5);
+}
+
+.hidden-files-toggle input:checked + .hidden-files-check {
+  border-color: #d44866;
+  background: linear-gradient(145deg, #ef5d79, #a92343);
+  box-shadow: 0 0 10px rgba(216, 59, 90, 0.24);
+}
+
+.hidden-files-toggle input:checked + .hidden-files-check::after {
+  position: absolute;
+  top: 1px;
+  left: 4px;
+  width: 4px;
+  height: 8px;
+  transform: rotate(45deg);
+  border: solid #fff;
+  border-width: 0 1.5px 1.5px 0;
+  content: "";
+}
+
+.hidden-files-toggle input:focus-visible + .hidden-files-check {
+  outline: 2px solid #fa7184;
+  outline-offset: 2px;
 }
 
 .utility-button {
@@ -2117,7 +2298,7 @@ details.tool-card summary {
     min-height: 40.8px;
     margin: 0;
     overflow: hidden;
-    padding: 0 7.2px;
+    padding: 6px 9px;
     font-size: 9.6px;
     text-overflow: ellipsis;
     white-space: nowrap;
@@ -2413,7 +2594,8 @@ summary,
 }
 
 .session-row:focus-within .session-delete {
-  display: block;
+  opacity: 1;
+  pointer-events: auto;
 }
 
 .center-pane {

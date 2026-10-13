@@ -92,6 +92,7 @@ type RetryStatus = {
 };
 type FileItem = { name: string; path: string; type: "file" | "directory" };
 type MessageMenu = { messageId: string; text: string; selected: number };
+type SessionContextMenu = { sessionId: string; x: number; y: number };
 const localCommands = [
   { name: "help", description: "Afficher les commandes locales" },
   { name: "clear", description: "Effacer l’affichage sans supprimer l’historique" },
@@ -233,6 +234,7 @@ function App() {
   const [clearedChat, setClearedChat] = useState<{ sessionId: string; messageCount: number } | null>(null);
   const [busy, setBusy] = useState(false);
   const [messageMenu, setMessageMenu] = useState<MessageMenu | null>(null);
+  const [sessionContextMenu, setSessionContextMenu] = useState<SessionContextMenu | null>(null);
   const [editingMessageId, setEditingMessageId] = useState("");
   const [editedText, setEditedText] = useState("");
   const [ready, setReady] = useState(false);
@@ -243,6 +245,7 @@ function App() {
   const [search, setSearch] = useState("");
   const [activePanel, setActivePanel] = useState<"files" | "sessions" | "mcp">("files");
   const [files, setFiles] = useState<FileItem[]>([]);
+  const [showHiddenFiles, setShowHiddenFiles] = useState(false);
   const [filePath, setFilePath] = useState("");
   const [fileContent, setFileContent] = useState("");
   const [showProvider, setShowProvider] = useState(false);
@@ -289,6 +292,10 @@ function App() {
   const visibleSessions = useMemo(
     () => appState.sessions.filter((session) => session.title.toLowerCase().includes(search.toLowerCase())),
     [appState.sessions, search],
+  );
+  const visibleFiles = useMemo(
+    () => files.filter((file) => showHiddenFiles || !file.name.startsWith(".")),
+    [files, showHiddenFiles],
   );
   const commandSuggestions = input.startsWith("/")
     ? localCommands.filter((command) => command.name.startsWith(input.slice(1).split(/\s+/)[0].toLowerCase())).slice(0, 5)
@@ -1303,7 +1310,10 @@ function App() {
   useEffect(() => {
     const onModalEscape = (event: KeyboardEvent) => {
       if (event.key !== "Escape" || messageMenu) return;
-      if (pendingApproval) {
+      if (sessionContextMenu) {
+        event.preventDefault();
+        setSessionContextMenu(null);
+      } else if (pendingApproval) {
         event.preventDefault();
         void resolveApproval(false);
       } else if (pendingQuestion) {
@@ -1322,7 +1332,7 @@ function App() {
     };
     window.addEventListener("keydown", onModalEscape);
     return () => window.removeEventListener("keydown", onModalEscape);
-  }, [messageMenu, pendingApproval, pendingQuestion, showCommand, showSkills, showProvider, resolveApproval, stopGeneration]);
+  }, [messageMenu, sessionContextMenu, pendingApproval, pendingQuestion, showCommand, showSkills, showProvider, resolveApproval, stopGeneration]);
 
   const changeMode = async (nextMode: "build" | "plan" | "discussion") => {
     setMode(nextMode);
@@ -1342,6 +1352,31 @@ function App() {
       const updated = await invoke<AppState>("delete_chat_session", { sessionId: session.id });
       setAppState(updated);
       if (sessionId === session.id) selectSession("");
+    } catch (reason) {
+      setError(friendlyError(reason));
+    }
+  };
+
+  const openSessionContextMenu = (event: React.MouseEvent, session: Session) => {
+    event.preventDefault();
+    setSessionContextMenu({
+      sessionId: session.id,
+      x: Math.max(8, Math.min(event.clientX, Math.max(8, window.innerWidth - 188))),
+      y: Math.max(8, Math.min(event.clientY, Math.max(8, window.innerHeight - 140))),
+    });
+  };
+
+  const renameSession = async (session: Session) => {
+    setSessionContextMenu(null);
+    const title = window.prompt("Nouveau nom de la session :", session.title);
+    if (title === null || !title.trim()) return;
+    try {
+      const updated = await invoke<AppState>("rename_chat_session", {
+        sessionId: session.id,
+        title: title.trim(),
+      });
+      setAppState(updated);
+      setError("");
     } catch (reason) {
       setError(friendlyError(reason));
     }
@@ -1367,6 +1402,8 @@ function App() {
       setError(friendlyError(reason));
     }
   };
+
+  const contextMenuSession = appState.sessions.find((session) => session.id === sessionContextMenu?.sessionId);
 
   const messages = [
     ...((currentSession?.messages ?? []).slice(
@@ -1442,7 +1479,7 @@ function App() {
           <label className="search-box"><span>⌕</span><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Filtrer les sessions…" /></label>
           <nav className="session-list">
             {visibleSessions.map((session) => (
-              <div key={session.id} className={`session-row ${session.id === sessionId ? "selected" : ""}`}>
+              <div key={session.id} className={`session-row ${session.id === sessionId ? "selected" : ""}`} onContextMenu={(event) => openSessionContextMenu(event, session)}>
                 <button className="session-select" onClick={() => selectSession(session.id)}><span className="session-glyph">›_</span><span className="session-title">{session.title}</span></button>
                 <button className="session-delete" aria-label={`Supprimer la session ${session.title}`} onClick={() => void removeSession(session)}>×</button>
               </div>
@@ -1657,7 +1694,8 @@ function App() {
             {(["files", "sessions", "mcp"] as const).map((tab) => <button key={tab} className={activePanel === tab ? "active" : ""} onClick={() => setActivePanel(tab)}>{tab === "files" ? "FICHIERS" : tab === "sessions" ? "STATS" : "MCP"}</button>)}
           </div>
           {activePanel === "files" && <div className="inspector-content"><div className="panel-title"><span>EXPLORATEUR LOCAL</span><button aria-label="Actualiser l’explorateur de fichiers" onClick={() => void refreshExplorer().catch((reason: unknown) => setError(friendlyError(reason)))}>↻</button></div><div className="current-path" title={filePath}>{filePath.replace(projectPath, "~") || "~"}</div>
-            {fileContent ? <div className="file-preview"><button onClick={() => setFileContent("")}>← RETOUR</button><pre>{fileContent}</pre></div> : <div className="file-tree">{filePath !== projectPath && <button className="parent-folder" onClick={() => { const parent = filePath.split("/").slice(0, -1).join("/") || projectPath; void invoke<FileItem[]>("list_project_files", { projectPath, requestedPath: parent }).then((items) => { setFiles(items); setFilePath(parent); setError(""); }).catch((reason: unknown) => setError(friendlyError(reason))); }}>‹ DOSSIER PARENT</button>}{files.map((file) => <button key={file.path} className="file-row" onClick={() => void loadFile(file)}><span>{file.type === "directory" ? "▸" : "·"}</span>{file.name}</button>)}</div>}
+            {!fileContent && <label className="hidden-files-toggle"><input type="checkbox" checked={showHiddenFiles} onChange={(event) => setShowHiddenFiles(event.target.checked)} /><span className="hidden-files-check" /><span>Afficher les fichiers cachés</span></label>}
+            {fileContent ? <div className="file-preview"><button onClick={() => setFileContent("")}>← RETOUR</button><pre>{fileContent}</pre></div> : <div className="file-tree">{filePath !== projectPath && <button className="parent-folder" onClick={() => { const parent = filePath.split("/").slice(0, -1).join("/") || projectPath; void invoke<FileItem[]>("list_project_files", { projectPath, requestedPath: parent }).then((items) => { setFiles(items); setFilePath(parent); setError(""); }).catch((reason: unknown) => setError(friendlyError(reason))); }}>‹ DOSSIER PARENT</button>}{visibleFiles.map((file) => <button key={file.path} className={`file-row ${file.type === "directory" ? "directory" : "file"}`} onClick={() => void loadFile(file)} title={file.name}><span className="file-row-icon">{file.type === "directory" ? "▸" : "·"}</span><span className="file-row-name">{file.name}</span>{file.type === "directory" && <span className="file-row-chevron">›</span>}</button>)}{visibleFiles.length === 0 && <p className="file-tree-empty">{showHiddenFiles ? "Ce dossier est vide." : "Aucun élément visible dans ce dossier."}</p>}</div>}
             <button className="utility-button" onClick={() => setShowCommand(true)}>$_ TERMINAL (CONFIRMATION REQUISE)</button>
           </div>}
           {activePanel === "sessions" && <div className="inspector-content"><div className="panel-title"><span>STATISTIQUES LOCALES</span></div><p className="empty-side">Cette version autonome ne facture et ne transmet aucun compteur de tokens à un serveur LUCY.</p><p className="current-path">{appState.sessions.length} sessions sauvegardées en local</p><p className="current-path">{currentSession?.messages.length ?? 0} messages dans cette session</p></div>}
@@ -1666,6 +1704,18 @@ function App() {
       </section>
 
       <footer className="statusbar"><div><span className={`status-dot ${ready ? "online" : ""}`} />{ready ? "MOTEUR AUTONOME ACTIF" : "INITIALISATION…"}</div><div className="status-right"><span>{appState.providers.length} FOURNISSEUR{appState.providers.length === 1 ? "" : "S"}</span><span>IDENTIFIANTS LOCAUX</span><span>v0.2.0</span></div></footer>
+
+      {sessionContextMenu && contextMenuSession && <div className="session-context-backdrop" onMouseDown={(event) => {
+        if (event.target === event.currentTarget) setSessionContextMenu(null);
+      }} onContextMenu={(event) => event.preventDefault()}>
+        <div className="session-context-menu" role="menu" aria-label={`Actions pour ${contextMenuSession.title}`} style={{ left: sessionContextMenu.x, top: sessionContextMenu.y }}>
+          <div className="session-context-heading">SESSION</div>
+          <button role="menuitem" onClick={() => { selectSession(contextMenuSession.id); setSessionContextMenu(null); }}><span>↗</span> Ouvrir</button>
+          <button role="menuitem" onClick={() => void renameSession(contextMenuSession)}><span>✎</span> Renommer</button>
+          <div className="session-context-divider" />
+          <button className="danger" role="menuitem" onClick={() => { setSessionContextMenu(null); void removeSession(contextMenuSession); }}><span>×</span> Supprimer</button>
+        </div>
+      </div>}
 
       {messageMenu && <div className="message-menu-backdrop" onMouseDown={(event) => {
         if (event.target === event.currentTarget) setMessageMenu(null);
