@@ -2654,6 +2654,22 @@ fn opencode_session_id(response: &Value) -> Result<String, String> {
         .ok_or_else(|| "OpenCode a créé une session sans renvoyer son identifiant.".into())
 }
 
+fn opencode_assistant_text(messages_response: &Value) -> Option<String> {
+    messages_response["data"]
+        .as_array()?
+        .iter()
+        .find(|message| message["type"] == "assistant")
+        .and_then(|message| message["content"].as_array())
+        .map(|parts| {
+            parts
+                .iter()
+                .filter(|part| part["type"] == "text")
+                .filter_map(|part| part["text"].as_str())
+                .collect::<String>()
+        })
+        .filter(|text| !text.trim().is_empty())
+}
+
 async fn run_opencode_model(
     app: &AppHandle,
     state: &AppState,
@@ -2861,6 +2877,7 @@ async fn run_opencode_model(
     });
     let mut prompt_task = prompt_task;
     let mut prompt_finished = false;
+    let mut wait_task = None;
     let mut answer = String::new();
     let mut tools: Vec<OpenCodeToolEvent> = Vec::new();
     let mut timeline = Vec::new();
@@ -2868,6 +2885,7 @@ async fn run_opencode_model(
     let mut line_buffer = Vec::new();
     let mut run_error = None;
     let mut session_idle = false;
+    let mut generation_started = false;
 
     loop {
         if *cancel.borrow() {
@@ -2899,10 +2917,40 @@ async fn run_opencode_model(
             prompt_result = &mut prompt_task, if !prompt_finished => {
                 prompt_finished = true;
                 match prompt_result {
-                    Ok(Ok(_)) => {}
+                    Ok(Ok(_)) => {
+                        generation_started = true;
+                        let wait_client = client.clone();
+                        let wait_base_url = base_url.clone();
+                        let wait_password = password.clone();
+                        let wait_session_id = session_id.clone();
+                        wait_task = Some(tokio::spawn(async move {
+                            opencode_api_json(
+                                &wait_client,
+                                &wait_base_url,
+                                &wait_password,
+                                reqwest::Method::POST,
+                                &format!("/api/experimental/session/{wait_session_id}/wait"),
+                                None,
+                            ).await
+                        }));
+                    }
                     Ok(Err(error)) => run_error = Some(error),
                     Err(error) => run_error = Some(format!("La requête OpenCode a échoué : {error}")),
                 }
+            }
+            wait_result = async {
+                match wait_task.as_mut() {
+                    Some(task) => Some(task.await),
+                    None => std::future::pending().await,
+                }
+            }, if wait_task.is_some() => {
+                match wait_result {
+                    Some(Ok(Ok(_))) => session_idle = true,
+                    Some(Ok(Err(error))) => run_error = Some(error),
+                    Some(Err(error)) => run_error = Some(format!("L’attente de la fin OpenCode a échoué : {error}")),
+                    None => {}
+                }
+                wait_task = None;
             }
             chunk = event_stream.next() => {
                 let Some(chunk) = chunk else {
@@ -2938,8 +2986,16 @@ async fn run_opencode_model(
                     if event_session_id != Some(session_id.as_str()) { continue; }
 
                     if event_type == "session.idle" {
-                        session_idle = true;
+                        if generation_started {
+                            session_idle = true;
+                        }
                         continue;
+                    }
+                    if matches!(
+                        event_type,
+                        "message.part.updated" | "message.part.delta" | "form.created" | "permission.asked"
+                    ) {
+                        generation_started = true;
                     }
                     if event_type == "session.error" {
                         run_error = Some(
@@ -3171,12 +3227,19 @@ async fn run_opencode_model(
                 }
             }
         }
-        if prompt_finished && session_idle {
+        if session_idle {
             break;
         }
         if prompt_finished && run_error.is_some() {
             break;
         }
+    }
+
+    if !prompt_finished {
+        prompt_task.abort();
+    }
+    if let Some(wait_task) = wait_task {
+        wait_task.abort();
     }
 
     if let Some(error) = run_error {
@@ -3187,6 +3250,19 @@ async fn run_opencode_model(
                 && is_retryable_opencode_session_error(&error),
             message: format!("Le moteur OpenCode a échoué : {error}"),
         });
+    }
+    if answer.trim().is_empty() {
+        let messages = opencode_api_json(
+            &client,
+            &base_url,
+            &password,
+            reqwest::Method::GET,
+            &format!("/api/session/{session_id}/message?order=desc&limit=20"),
+            None,
+        )
+        .await
+        .map_err(OpenCodeRunFailure::new)?;
+        answer = opencode_assistant_text(&messages).unwrap_or_default();
     }
     if answer.trim().is_empty()
         && !tools
@@ -5532,6 +5608,51 @@ mod tests {
             "ses_legacy"
         );
         assert!(opencode_session_id(&serde_json::json!({ "data": {} })).is_err());
+    }
+
+    #[test]
+    fn extracts_assistant_text_from_opencode_message_response() {
+        let messages = serde_json::json!({
+            "data": [
+                {
+                    "type": "assistant",
+                    "content": [
+                        { "type": "reasoning", "text": "private" },
+                        { "type": "text", "text": "La réponse " },
+                        { "type": "text", "text": "finale." }
+                    ]
+                },
+                { "type": "user", "content": [] }
+            ]
+        });
+        assert_eq!(
+            opencode_assistant_text(&messages).as_deref(),
+            Some("La réponse finale.")
+        );
+        assert_eq!(
+            opencode_assistant_text(&serde_json::json!({ "data": [] })),
+            None
+        );
+    }
+
+    #[test]
+    fn reads_the_latest_completed_assistant_text_without_exposing_reasoning() {
+        let messages = serde_json::json!({
+            "data": [
+                {
+                    "type": "assistant",
+                    "content": [{ "type": "text", "text": "Réponse finale." }]
+                },
+                {
+                    "type": "assistant",
+                    "content": [{ "type": "text", "text": "Réponse précédente." }]
+                }
+            ]
+        });
+        assert_eq!(
+            opencode_assistant_text(&messages).as_deref(),
+            Some("Réponse finale.")
+        );
     }
 
     #[test]
