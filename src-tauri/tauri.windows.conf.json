@@ -1,11 +1,11 @@
 {
+  "productName": "LUCY",
   "bundle": {
     "targets": ["nsis"],
     "windows": {
       "nsis": {
         "installMode": "currentUser",
-        "languages": ["French", "English"],
-        "installerHooks": "windows/nsis-hooks.nsh"
+        "languages": ["French", "English"]
       }
     }
   }

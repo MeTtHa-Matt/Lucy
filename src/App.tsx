@@ -1493,9 +1493,20 @@ function App() {
         </aside>
 
         <section className="center-pane">
-          <div className="topbar">
+          <div
+            className="topbar"
+            data-tauri-drag-region
+            onMouseDown={(event) => {
+              if (
+                event.button !== 0
+                || !(event.target instanceof Element)
+                || event.target.closest("button, a, input, textarea, select, [role='button']")
+              ) return;
+              void windowControls?.startDragging().catch((reason: unknown) => setError(friendlyError(reason)));
+            }}
+          >
             <div className="breadcrumb"><span className="crumb-dim">LUCY</span><span className="crumb-slash">/</span><span>{currentSession?.title ?? (projectPath ? "SESSION EN ATTENTE" : "SYSTÈME HORS LIGNE")}</span></div>
-            <div className="toolbar-actions">
+            <div className="toolbar-actions" data-tauri-drag-region="false">
               <button className="icon-button" title="Nouvelle session" aria-label="Nouvelle session" onClick={() => void createSession()}>＋</button>
               <button className="icon-button" title="Terminal avec confirmation" aria-label="Ouvrir le terminal local" onClick={() => setShowCommand(true)} disabled={!projectPath}>$_</button>
             </div>

@@ -131,8 +131,9 @@ if (-not (Test-Path $VsDevCmd)) { throw "VsDevCmd.bat introuvable dans l’insta
 $CargoTargetDir = Join-Path $env:LOCALAPPDATA "Lucy\installer-cargo-target"
 New-Item -ItemType Directory -Path $CargoTargetDir -Force | Out-Null
 $env:CARGO_TARGET_DIR = $CargoTargetDir
-$DesktopShortcut = Join-Path ([Environment]::GetFolderPath("Desktop")) "LUCY.lnk"
-$InstallMode = if (Test-Path $DesktopShortcut) { "MISE À JOUR" } else { "INSTALLATION" }
+$DataDir = Join-Path $env:APPDATA "com.lucy.neural"
+$StorePath = Join-Path $DataDir "lucy.json"
+$InstallMode = if (Test-Path $StorePath) { "MISE À JOUR" } else { "INSTALLATION" }
 
 Show-Frame "03  /  $InstallMode" "Compilation de LUCY pour Windows"
 Push-Location $Root
@@ -160,18 +161,12 @@ $Installer = Get-ChildItem -Path $NsisDir -Filter "*-setup.exe" -File -ErrorActi
 if (-not $Installer) { throw "Le paquet d’installation NSIS est introuvable dans $NsisDir." }
 
 Show-Frame "04  /  INSTALLATION WINDOWS" "Lancement de l’installateur LUCY"
-$InstallerProcess = Start-Process -FilePath $Installer.FullName -Wait -PassThru
+$InstallerArguments = if ($InstallMode -eq "MISE À JOUR") { @("/S") } else { @() }
+$InstallerProcess = Start-Process -FilePath $Installer.FullName -ArgumentList $InstallerArguments -Wait -PassThru
 if ($InstallerProcess.ExitCode -ne 0) {
     throw "L’installateur Windows a échoué (code $($InstallerProcess.ExitCode))."
 }
-$Shortcut = New-Object -ComObject WScript.Shell
-$ShortcutTarget = $Shortcut.CreateShortcut($DesktopShortcut).TargetPath
-if (-not $ShortcutTarget -or -not (Test-Path $ShortcutTarget)) {
-    throw "L’installation est terminée mais le raccourci de LUCY est introuvable sur le Bureau."
-}
 
-$DataDir = Join-Path $env:APPDATA "com.lucy.neural"
-$StorePath = Join-Path $DataDir "lucy.json"
 $SavedName = $null
 if (Test-Path $StorePath) {
     try {
@@ -200,8 +195,7 @@ if (-not $SavedName) {
 }
 
 Show-Frame "05  /  TERMINÉ" "LUCY · $InstallMode terminée"
-Write-Host "  Application installée : $ShortcutTarget" -ForegroundColor $Green
-Write-Host "  Raccourcis créés dans le menu Démarrer et sur le Bureau." -ForegroundColor $Green
+Write-Host "  Application et raccourcis gérés par l’installateur Windows." -ForegroundColor $Green
 Write-Host "  Salut $UserName — ton prénom est enregistré localement." -ForegroundColor $Dim
 Write-Host ""
 Read-Host "  Entrée pour fermer"
