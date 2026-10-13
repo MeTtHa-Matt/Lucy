@@ -1205,29 +1205,8 @@ fn parse_opencode_run_event(line: &str) -> Result<OpenCodeRunEvent, String> {
     let event: Value = serde_json::from_str(line)
         .map_err(|error| format!("Événement JSON OpenCode invalide : {error}"))?;
     let part = &event["part"];
-    let state = &part["state"];
     let tool = if event["type"] == "tool_use" || part["type"] == "tool" {
-        let status = state["status"].as_str().unwrap_or("completed");
-        let id = event["callID"]
-            .as_str()
-            .or_else(|| part["callID"].as_str())
-            .or_else(|| part["id"].as_str())
-            .unwrap_or_default();
-        let name = part["tool"].as_str().unwrap_or("outil");
-        (!id.is_empty()).then(|| OpenCodeToolEvent {
-            id: id.to_string(),
-            name: name.to_string(),
-            arguments: state
-                .get("input")
-                .cloned()
-                .unwrap_or_else(|| serde_json::json!({})),
-            status: status.to_string(),
-            result: state["output"]
-                .as_str()
-                .or_else(|| state["error"].as_str())
-                .unwrap_or_default()
-                .to_string(),
-        })
+        opencode_tool_event_from_part(part)
     } else {
         None
     };
@@ -2687,6 +2666,109 @@ fn opencode_assistant_text(messages_response: &Value) -> Option<String> {
         .next()
 }
 
+fn opencode_tool_event_from_part(part: &Value) -> Option<OpenCodeToolEvent> {
+    if part["type"] != "tool" {
+        return None;
+    }
+    let state = &part["state"];
+    let id = part["id"]
+        .as_str()
+        .or_else(|| part["callID"].as_str())
+        .filter(|id| !id.is_empty())?;
+    let name = part["name"]
+        .as_str()
+        .or_else(|| part["tool"].as_str())
+        .unwrap_or("outil");
+    let arguments = state
+        .get("input")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    let arguments = arguments
+        .as_str()
+        .and_then(|input| serde_json::from_str(input).ok())
+        .unwrap_or(arguments);
+    let result = state["content"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|content| content["text"].as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let result = if result.is_empty() {
+        state["error"]["message"]
+            .as_str()
+            .or_else(|| state["error"].as_str())
+            .or_else(|| state["output"].as_str())
+            .unwrap_or_default()
+            .to_string()
+    } else {
+        result
+    };
+    Some(OpenCodeToolEvent {
+        id: id.to_string(),
+        name: name.to_string(),
+        arguments,
+        status: state["status"].as_str().unwrap_or("completed").to_string(),
+        result,
+    })
+}
+
+fn opencode_timeline_from_messages(
+    messages_response: &Value,
+    started_at: u64,
+) -> (Vec<OpenCodeToolEvent>, Vec<OpenCodeTimelineItem>) {
+    let mut tools = Vec::new();
+    let mut timeline = Vec::new();
+    let Some(messages) = messages_response["data"].as_array() else {
+        return (tools, timeline);
+    };
+
+    // The API request asks for newest-first; walk the page in chronological order.
+    for message in messages.iter().rev() {
+        let info = message.get("info").unwrap_or(message);
+        if info["type"] != "assistant" {
+            continue;
+        }
+        let created_at = info["time"]["created"]
+            .as_u64()
+            .or_else(|| info["time"]["created"].as_f64().map(|value| value as u64));
+        if created_at.is_some_and(|created_at| created_at < started_at) {
+            continue;
+        }
+        let Some(parts) = message["content"]
+            .as_array()
+            .or_else(|| message["parts"].as_array())
+            .or_else(|| info["content"].as_array())
+        else {
+            continue;
+        };
+        for part in parts {
+            match part["type"].as_str() {
+                Some("text") => {
+                    if let Some(text) = part["text"].as_str() {
+                        append_opencode_text(&mut timeline, text);
+                    }
+                }
+                Some("tool") => {
+                    let Some(tool) = opencode_tool_event_from_part(part) else {
+                        continue;
+                    };
+                    if let Some(index) = tools.iter().position(|existing| existing.id == tool.id) {
+                        tools[index] = tool;
+                    } else {
+                        if !is_opencode_question_tool(&tool.name) {
+                            timeline.push(OpenCodeTimelineItem::Tool(tool.id.clone()));
+                        }
+                        tools.push(tool);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    (tools, timeline)
+}
+
 fn opencode_text_delta(
     payload: &Value,
     seen_parts: &mut BTreeMap<String, String>,
@@ -2919,6 +3001,7 @@ async fn run_opencode_model(
         opencode_session_id(&created).map_err(OpenCodeRunFailure::new)?
     };
 
+    let started_at = now_millis();
     let prompt_client = client.clone();
     let prompt_password = password.clone();
     let prompt_base_url = base_url.clone();
@@ -3229,56 +3312,42 @@ async fn run_opencode_model(
                     }
                     if event_type == "message.part.updated" {
                         let part = properties.get("part").unwrap_or(properties);
-                        if part["type"] == "tool" {
-                            let state = &part["state"];
-                            let id = part["callID"].as_str().or_else(|| part["id"].as_str())
-                                .unwrap_or_default();
-                            let name = part["tool"].as_str().unwrap_or("outil");
-                            if !id.is_empty() {
-                                let tool = OpenCodeToolEvent {
-                                    id: id.to_string(),
-                                    name: name.to_string(),
-                                    arguments: state.get("input").cloned().unwrap_or_else(|| serde_json::json!({})),
-                                    status: state["status"].as_str().unwrap_or("running").to_string(),
-                                    result: state["output"].as_str().or_else(|| state["error"].as_str())
-                                        .unwrap_or_default().to_string(),
-                                };
-                                if let Some(previous) = tools.iter_mut().find(|previous| previous.id == tool.id) {
-                                    *previous = tool.clone();
+                        if let Some(tool) = opencode_tool_event_from_part(part) {
+                            if let Some(previous) = tools.iter_mut().find(|previous| previous.id == tool.id) {
+                                *previous = tool.clone();
+                            } else {
+                                tools.push(tool.clone());
+                            }
+                            if started_tools.insert(tool.id.clone()) && !is_opencode_question_tool(&tool.name) {
+                                timeline.push(OpenCodeTimelineItem::Tool(tool.id.clone()));
+                                let _ = app.emit(CHAT_UPDATE, ChatUpdate {
+                                    session_id: session.id.clone(),
+                                    message_id: tool.id.clone(),
+                                    kind: "tool_start".into(),
+                                    delta: String::new(),
+                                    error: None,
+                                    details: Some(serde_json::json!({
+                                        "name": tool.name,
+                                        "arguments": tool.arguments,
+                                    })),
+                                });
+                            }
+                            if !is_opencode_question_tool(&tool.name)
+                                && !matches!(tool.status.as_str(), "running" | "pending" | "streaming")
+                            {
+                                let result = if tool.result.is_empty() && tool.status == "error" {
+                                    "L’outil OpenCode a échoué.".to_string()
                                 } else {
-                                    tools.push(tool.clone());
-                                }
-                                if started_tools.insert(tool.id.clone()) && !is_opencode_question_tool(&tool.name) {
-                                    timeline.push(OpenCodeTimelineItem::Tool(tool.id.clone()));
-                                    let _ = app.emit(CHAT_UPDATE, ChatUpdate {
-                                        session_id: session.id.clone(),
-                                        message_id: tool.id.clone(),
-                                        kind: "tool_start".into(),
-                                        delta: String::new(),
-                                        error: None,
-                                        details: Some(serde_json::json!({
-                                            "name": tool.name,
-                                            "arguments": tool.arguments,
-                                        })),
-                                    });
-                                }
-                                if !is_opencode_question_tool(&tool.name)
-                                    && !matches!(tool.status.as_str(), "running" | "pending")
-                                {
-                                    let result = if tool.result.is_empty() && tool.status == "error" {
-                                        "L’outil OpenCode a échoué.".to_string()
-                                    } else {
-                                        tool.result.chars().take(5_000).collect()
-                                    };
-                                    let _ = app.emit(CHAT_UPDATE, ChatUpdate {
-                                        session_id: session.id.clone(),
-                                        message_id: tool.id,
-                                        kind: "tool_result".into(),
-                                        delta: String::new(),
-                                        error: None,
-                                        details: Some(serde_json::json!({ "result": result })),
-                                    });
-                                }
+                                    tool.result.chars().take(5_000).collect()
+                                };
+                                let _ = app.emit(CHAT_UPDATE, ChatUpdate {
+                                    session_id: session.id.clone(),
+                                    message_id: tool.id,
+                                    kind: "tool_result".into(),
+                                    delta: String::new(),
+                                    error: None,
+                                    details: Some(serde_json::json!({ "result": result })),
+                                });
                             }
                         }
                     }
@@ -3309,18 +3378,29 @@ async fn run_opencode_model(
             message: format!("Le moteur OpenCode a échoué : {error}"),
         });
     }
-    if answer.trim().is_empty() {
-        let messages = opencode_api_json(
-            &client,
-            &base_url,
-            &password,
-            reqwest::Method::GET,
-            &format!("/api/session/{session_id}/message?order=desc&limit=20"),
-            None,
-        )
-        .await
-        .map_err(OpenCodeRunFailure::new)?;
-        answer = opencode_assistant_text(&messages).unwrap_or_default();
+    let messages_result = opencode_api_json(
+        &client,
+        &base_url,
+        &password,
+        reqwest::Method::GET,
+        &format!("/api/session/{session_id}/message?order=desc&limit=100"),
+        None,
+    )
+    .await;
+    if let Ok(messages) = &messages_result {
+        if answer.trim().is_empty() {
+            answer = opencode_assistant_text(messages).unwrap_or_default();
+        }
+        let (history_tools, history_timeline) =
+            opencode_timeline_from_messages(messages, started_at);
+        if !history_tools.is_empty() {
+            tools = history_tools;
+        }
+        if !history_timeline.is_empty() {
+            timeline = history_timeline;
+        }
+    } else if answer.trim().is_empty() {
+        return Err(OpenCodeRunFailure::new(messages_result.unwrap_err()));
     }
     if answer.trim().is_empty()
         && !tools
@@ -5696,6 +5776,73 @@ mod tests {
             opencode_assistant_text(&serde_json::json!({ "data": [] })),
             None
         );
+    }
+
+    #[test]
+    fn rebuilds_opencode_timeline_from_assistant_messages_and_tool_parts() {
+        let messages = serde_json::json!({
+            "data": [
+                {
+                    "info": { "type": "assistant", "time": { "created": 300 } },
+                    "parts": [
+                        { "type": "reasoning", "text": "raisonnement privé" },
+                        { "type": "text", "text": "Résumé : je vérifie le projet." }
+                    ]
+                },
+                {
+                    "info": { "type": "assistant", "time": { "created": 200 } },
+                    "parts": [
+                        {
+                            "type": "tool",
+                            "id": "tool-1",
+                            "name": "read",
+                            "state": {
+                                "status": "completed",
+                                "input": { "filePath": "README.md" },
+                                "content": [{ "type": "text", "text": "Contenu du fichier" }]
+                            }
+                        },
+                        { "type": "text", "text": "J’ai lu le fichier." }
+                    ]
+                },
+                {
+                    "info": { "type": "assistant", "time": { "created": 99 } },
+                    "parts": [{ "type": "text", "text": "Ancien message." }]
+                },
+                {
+                    "info": { "type": "user", "time": { "created": 250 } },
+                    "parts": [{ "type": "text", "text": "Ne pas afficher." }]
+                }
+            ]
+        });
+
+        let (tools, timeline) = opencode_timeline_from_messages(&messages, 100);
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, "read");
+        assert_eq!(tools[0].arguments["filePath"], "README.md");
+        assert_eq!(tools[0].result, "Contenu du fichier");
+        assert_eq!(timeline.len(), 2);
+        assert!(matches!(
+            &timeline[0],
+            OpenCodeTimelineItem::Tool(id) if id == "tool-1"
+        ));
+        assert!(matches!(
+            &timeline[1],
+            OpenCodeTimelineItem::Text(text) if text == "J’ai lu le fichier.Résumé : je vérifie le projet."
+        ));
+    }
+
+    #[test]
+    fn parses_native_opencode_tool_part_fields() {
+        let event = parse_opencode_run_event(
+            r#"{"type":"tool_use","part":{"type":"tool","id":"call-1","name":"question","state":{"status":"completed","input":{"questions":[{"question":"Continuer ?"}]},"content":[{"type":"text","text":"done"}]}}}"#,
+        )
+        .unwrap();
+        let tool = event.tool.unwrap();
+        assert_eq!(tool.id, "call-1");
+        assert_eq!(tool.name, "question");
+        assert_eq!(tool.arguments["questions"][0]["question"], "Continuer ?");
+        assert_eq!(tool.result, "done");
     }
 
     #[test]
