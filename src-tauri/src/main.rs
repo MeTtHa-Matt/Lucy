@@ -2658,16 +2658,66 @@ fn opencode_assistant_text(messages_response: &Value) -> Option<String> {
     messages_response["data"]
         .as_array()?
         .iter()
-        .find(|message| message["type"] == "assistant")
-        .and_then(|message| message["content"].as_array())
-        .map(|parts| {
-            parts
+        .filter_map(|message| {
+            let info = message.get("info").unwrap_or(message);
+            if info["type"] != "assistant" {
+                return None;
+            }
+            let parts = message["content"]
+                .as_array()
+                .or_else(|| message["parts"].as_array())
+                .or_else(|| info["content"].as_array())?;
+            let text = parts
                 .iter()
                 .filter(|part| part["type"] == "text")
                 .filter_map(|part| part["text"].as_str())
-                .collect::<String>()
+                .collect::<String>();
+            (!text.trim().is_empty()).then_some(text)
         })
-        .filter(|text| !text.trim().is_empty())
+        .next()
+}
+
+fn opencode_text_delta(
+    payload: &Value,
+    seen_parts: &mut BTreeMap<String, String>,
+) -> Option<String> {
+    let properties = &payload["properties"];
+    match payload["type"].as_str()? {
+        "message.part.delta" if properties["field"] == "text" => {
+            let part_id = properties["partID"].as_str()?;
+            let delta = properties["delta"].as_str()?;
+            if delta.is_empty() {
+                return None;
+            }
+            seen_parts
+                .entry(part_id.to_string())
+                .or_default()
+                .push_str(delta);
+            Some(delta.to_string())
+        }
+        "message.part.updated" => {
+            let part = &properties["part"];
+            if part["type"] != "text" {
+                return None;
+            }
+            let text = part["text"].as_str()?;
+            if text.is_empty() {
+                return None;
+            }
+            let part_id = part["id"]
+                .as_str()
+                .or_else(|| properties["partID"].as_str())
+                .unwrap_or("text");
+            let previous = seen_parts.entry(part_id.to_string()).or_default();
+            if !text.starts_with(previous.as_str()) {
+                return None;
+            }
+            let delta = text[previous.len()..].to_string();
+            previous.push_str(&delta);
+            (!delta.is_empty()).then_some(delta)
+        }
+        _ => None,
+    }
 }
 
 async fn run_opencode_model(
@@ -2882,6 +2932,7 @@ async fn run_opencode_model(
     let mut tools: Vec<OpenCodeToolEvent> = Vec::new();
     let mut timeline = Vec::new();
     let mut started_tools = std::collections::BTreeSet::new();
+    let mut seen_text_parts = BTreeMap::new();
     let mut line_buffer = Vec::new();
     let mut run_error = None;
     let mut session_idle = false;
@@ -3154,24 +3205,21 @@ async fn run_opencode_model(
                         ).await.map_err(OpenCodeRunFailure::new)?;
                         continue;
                     }
+                    if let Some(text) = opencode_text_delta(&payload, &mut seen_text_parts) {
+                        answer.push_str(&text);
+                        append_opencode_text(&mut timeline, &text);
+                        let _ = app.emit(CHAT_UPDATE, ChatUpdate {
+                            session_id: session.id.clone(),
+                            message_id: assistant_id.to_string(),
+                            kind: "delta".into(),
+                            delta: text,
+                            error: None,
+                            details: None,
+                        });
+                    }
                     if event_type == "message.part.updated" {
                         let part = properties.get("part").unwrap_or(properties);
-                        if part["type"] == "text" {
-                            if let Some(text) = properties["delta"].as_str() {
-                                if !text.is_empty() {
-                                    answer.push_str(text);
-                                    append_opencode_text(&mut timeline, text);
-                                    let _ = app.emit(CHAT_UPDATE, ChatUpdate {
-                                        session_id: session.id.clone(),
-                                        message_id: assistant_id.to_string(),
-                                        kind: "delta".into(),
-                                        delta: text.to_string(),
-                                        error: None,
-                                        details: None,
-                                    });
-                                }
-                            }
-                        } else if part["type"] == "tool" {
+                        if part["type"] == "tool" {
                             let state = &part["state"];
                             let id = part["callID"].as_str().or_else(|| part["id"].as_str())
                                 .unwrap_or_default();
@@ -5616,13 +5664,17 @@ mod tests {
             "data": [
                 {
                     "type": "assistant",
+                    "content": []
+                },
+                { "type": "user", "content": [] },
+                {
+                    "type": "assistant",
                     "content": [
                         { "type": "reasoning", "text": "private" },
                         { "type": "text", "text": "La réponse " },
                         { "type": "text", "text": "finale." }
                     ]
-                },
-                { "type": "user", "content": [] }
+                }
             ]
         });
         assert_eq!(
@@ -5633,6 +5685,32 @@ mod tests {
             opencode_assistant_text(&serde_json::json!({ "data": [] })),
             None
         );
+    }
+
+    #[test]
+    fn reads_opencode_text_delta_events_without_duplicating_part_snapshots() {
+        let mut seen_parts = BTreeMap::new();
+        let delta = serde_json::json!({
+            "type": "message.part.delta",
+            "properties": { "partID": "part-1", "field": "text", "delta": "Bonjour" }
+        });
+        let update = serde_json::json!({
+            "type": "message.part.updated",
+            "properties": {
+                "part": { "id": "part-1", "type": "text", "text": "Bonjour !" }
+            }
+        });
+        let repeated_update = update.clone();
+        assert_eq!(
+            opencode_text_delta(&delta, &mut seen_parts).as_deref(),
+            Some("Bonjour")
+        );
+        assert_eq!(
+            opencode_text_delta(&update, &mut seen_parts).as_deref(),
+            Some(" !")
+        );
+        assert_eq!(opencode_text_delta(&repeated_update, &mut seen_parts), None);
+        assert_eq!(seen_parts["part-1"], "Bonjour !");
     }
 
     #[test]
