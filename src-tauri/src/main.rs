@@ -2880,16 +2880,97 @@ fn opencode_text_delta(
                 .as_str()
                 .or_else(|| properties["partID"].as_str())
                 .unwrap_or("text");
-            let previous = seen_parts.entry(part_id.to_string()).or_default();
-            if !text.starts_with(previous.as_str()) {
-                return None;
-            }
-            let delta = text[previous.len()..].to_string();
-            previous.push_str(&delta);
-            (!delta.is_empty()).then_some(delta)
+            opencode_text_snapshot_delta(part_id, text, seen_parts)
         }
         _ => None,
     }
+}
+
+fn opencode_text_snapshot_delta(
+    part_id: &str,
+    text: &str,
+    seen_parts: &mut BTreeMap<String, String>,
+) -> Option<String> {
+    if text.is_empty() {
+        return None;
+    }
+    let previous = seen_parts.entry(part_id.to_string()).or_default();
+    if !text.starts_with(previous.as_str()) {
+        return None;
+    }
+    let delta = text[previous.len()..].to_string();
+    previous.push_str(&delta);
+    (!delta.is_empty()).then_some(delta)
+}
+
+fn opencode_text_deltas_from_messages(
+    messages_response: &Value,
+    started_at: u64,
+    seen_parts: &mut BTreeMap<String, String>,
+) -> Vec<String> {
+    let Some(messages) = messages_response["data"].as_array() else {
+        return Vec::new();
+    };
+    let mut deltas = Vec::new();
+    for message in messages.iter().rev() {
+        let info = message.get("info").unwrap_or(message);
+        if info["type"] != "assistant" {
+            continue;
+        }
+        let created_at = info["time"]["created"]
+            .as_u64()
+            .or_else(|| info["time"]["created"].as_f64().map(|value| value as u64));
+        if created_at.is_some_and(|created_at| created_at < started_at) {
+            continue;
+        }
+        let Some(parts) = message["content"]
+            .as_array()
+            .or_else(|| message["parts"].as_array())
+            .or_else(|| info["content"].as_array())
+        else {
+            continue;
+        };
+        let message_id = info["id"].as_str().unwrap_or("assistant");
+        for (index, part) in parts.iter().enumerate() {
+            if part["type"] != "text" {
+                continue;
+            }
+            let Some(text) = part["text"].as_str() else {
+                continue;
+            };
+            let part_id = part["id"]
+                .as_str()
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("{message_id}:{index}"));
+            if let Some(delta) = opencode_text_snapshot_delta(&part_id, text, seen_parts) {
+                deltas.push(delta);
+            }
+        }
+    }
+    deltas
+}
+
+fn emit_opencode_text_update(
+    app: &AppHandle,
+    session_id: &str,
+    assistant_id: &str,
+    text: String,
+    answer: &mut String,
+    timeline: &mut Vec<OpenCodeTimelineItem>,
+) {
+    answer.push_str(&text);
+    append_opencode_text(timeline, &text);
+    let _ = app.emit(
+        CHAT_UPDATE,
+        ChatUpdate {
+            session_id: session_id.to_string(),
+            message_id: assistant_id.to_string(),
+            kind: "delta".into(),
+            delta: text,
+            error: None,
+            details: None,
+        },
+    );
 }
 
 async fn run_opencode_model(
@@ -3190,6 +3271,20 @@ async fn run_opencode_model(
                         &format!("/api/session/{session_id}/message?order=desc&limit=100"),
                         None,
                     ).await {
+                        for text in opencode_text_deltas_from_messages(
+                            &messages,
+                            started_at,
+                            &mut seen_text_parts,
+                        ) {
+                            emit_opencode_text_update(
+                                app,
+                                &session.id,
+                                assistant_id,
+                                text,
+                                &mut answer,
+                                &mut timeline,
+                            );
+                        }
                         let (polled_tools, _) = opencode_timeline_from_messages(&messages, started_at);
                         for tool in polled_tools {
                             emit_opencode_tool_update(
@@ -3408,16 +3503,14 @@ async fn run_opencode_model(
                         continue;
                     }
                     if let Some(text) = opencode_text_delta(&payload, &mut seen_text_parts) {
-                        answer.push_str(&text);
-                        append_opencode_text(&mut timeline, &text);
-                        let _ = app.emit(CHAT_UPDATE, ChatUpdate {
-                            session_id: session.id.clone(),
-                            message_id: assistant_id.to_string(),
-                            kind: "delta".into(),
-                            delta: text,
-                            error: None,
-                            details: None,
-                        });
+                        emit_opencode_text_update(
+                            app,
+                            &session.id,
+                            assistant_id,
+                            text,
+                            &mut answer,
+                            &mut timeline,
+                        );
                     }
                     if event_type == "message.part.updated" {
                         let part = properties.get("part").unwrap_or(properties);
@@ -3470,6 +3563,16 @@ async fn run_opencode_model(
     )
     .await;
     if let Ok(messages) = &messages_result {
+        for text in opencode_text_deltas_from_messages(messages, started_at, &mut seen_text_parts) {
+            emit_opencode_text_update(
+                app,
+                &session.id,
+                assistant_id,
+                text,
+                &mut answer,
+                &mut timeline,
+            );
+        }
         if answer.trim().is_empty() {
             answer = opencode_assistant_text(messages).unwrap_or_default();
         }
@@ -5975,6 +6078,50 @@ mod tests {
         );
         assert_eq!(opencode_text_delta(&repeated_update, &mut seen_parts), None);
         assert_eq!(seen_parts["part-1"], "Bonjour !");
+    }
+
+    #[test]
+    fn streams_text_snapshots_from_opencode_history_without_repeating_sse_deltas() {
+        let mut seen_parts = BTreeMap::new();
+        let delta = serde_json::json!({
+            "type": "message.part.delta",
+            "properties": { "partID": "part-1", "field": "text", "delta": "Bonjour" }
+        });
+        assert_eq!(
+            opencode_text_delta(&delta, &mut seen_parts).as_deref(),
+            Some("Bonjour")
+        );
+
+        let first_snapshot = serde_json::json!({
+            "data": [{
+                "info": { "id": "msg-1", "type": "assistant", "time": { "created": 101 } },
+                "parts": [
+                    { "id": "part-1", "type": "text", "text": "Bonjour" },
+                    { "id": "part-2", "type": "text", "text": " tout le monde" }
+                ]
+            }]
+        });
+        assert_eq!(
+            opencode_text_deltas_from_messages(&first_snapshot, 100, &mut seen_parts),
+            vec![" tout le monde"]
+        );
+
+        let next_snapshot = serde_json::json!({
+            "data": [{
+                "info": { "id": "msg-1", "type": "assistant", "time": { "created": 101 } },
+                "parts": [
+                    { "id": "part-1", "type": "text", "text": "Bonjour !" },
+                    { "id": "part-2", "type": "text", "text": " tout le monde." }
+                ]
+            }]
+        });
+        assert_eq!(
+            opencode_text_deltas_from_messages(&next_snapshot, 100, &mut seen_parts),
+            vec![" !", "."]
+        );
+        assert!(
+            opencode_text_deltas_from_messages(&next_snapshot, 100, &mut seen_parts).is_empty()
+        );
     }
 
     #[test]
