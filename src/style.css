@@ -2783,7 +2783,7 @@ summary,
 
 .markdown-body table {
   width: 100%;
-  margin: 0.9em 0;
+  margin: 0 0 0.9em;
   overflow: hidden;
   border: 1.2px solid #443039;
   border-radius: 9.6px;
