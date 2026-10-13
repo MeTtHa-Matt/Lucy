@@ -6,6 +6,7 @@ use std::{
     ffi::OsString,
     fs::{self, OpenOptions},
     io::Write,
+    net::TcpListener,
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::Mutex,
@@ -18,7 +19,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::{
-    io::{AsyncBufReadExt, AsyncReadExt, BufReader},
     process::Command as TokioCommand,
     sync::{oneshot, watch},
 };
@@ -256,16 +256,26 @@ struct PendingApproval {
 
 struct PendingQuestion {
     session_id: String,
-    sender: oneshot::Sender<String>,
+    multiple: bool,
+    required: bool,
+    sender: oneshot::Sender<Value>,
 }
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct UserQuestion {
-    id: String,
     session_id: String,
+    questions: Vec<UserQuestionPrompt>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UserQuestionPrompt {
+    id: String,
     question: String,
     options: Vec<String>,
+    multiple: bool,
+    required: bool,
 }
 
 struct ActiveGeneration<'a> {
@@ -1102,7 +1112,6 @@ struct OpenCodeQuestion {
 struct OpenCodeRunEvent {
     session_id: Option<String>,
     text: Option<String>,
-    error: Option<String>,
     tool: Option<OpenCodeToolEvent>,
 }
 
@@ -1215,14 +1224,20 @@ fn parse_opencode_run_event(line: &str) -> Result<OpenCodeRunEvent, String> {
         text: (event["type"] == "text")
             .then(|| part["text"].as_str().map(str::to_owned))
             .flatten(),
-        error: (event["type"] == "error").then(|| {
-            event["error"]["message"]
-                .as_str()
-                .unwrap_or("Le moteur OpenCode a renvoyé une erreur.")
-                .to_string()
-        }),
         tool,
     })
+}
+
+fn parse_opencode_api_event(data: &str) -> Result<Value, String> {
+    let event: Value = serde_json::from_str(data)
+        .map_err(|error| format!("Événement JSON OpenCode invalide : {error}"))?;
+    let event = if let Some(encoded_event) = event.as_str() {
+        serde_json::from_str(encoded_event)
+            .map_err(|error| format!("Événement JSON OpenCode invalide : {error}"))?
+    } else {
+        event
+    };
+    Ok(event.get("payload").unwrap_or(&event).clone())
 }
 
 fn imported_provider(input: &serde_json::Value) -> Option<StoredProvider> {
@@ -2177,22 +2192,40 @@ fn answer_user_question(
     question_id: String,
     answer: String,
 ) -> Result<(), String> {
-    let answer = answer.trim().to_string();
-    if answer.is_empty() {
-        return Err("Saisis une réponse avant de continuer.".into());
-    }
+    let answer = answer.trim();
     if answer.chars().count() > 2_000 {
         return Err("La réponse ne peut pas dépasser 2 000 caractères.".into());
     }
-    let pending = state
+    let mut pending_questions = state
         .pending_questions
         .lock()
-        .map_err(|_| "Impossible d’accéder aux questions en attente.".to_string())?
+        .map_err(|_| "Impossible d’accéder aux questions en attente.".to_string())?;
+    let question = pending_questions
+        .get(&question_id)
+        .ok_or_else(|| "Cette question n’existe plus ou a été annulée.".to_string())?;
+    let value = if question.multiple {
+        let answers: Vec<String> = serde_json::from_str(answer)
+            .map_err(|_| "Sélectionne au moins une réponse valide.".to_string())?;
+        if (question.required && answers.is_empty())
+            || answers
+                .iter()
+                .any(|answer| answer.trim().is_empty() || answer.chars().count() > 160)
+        {
+            return Err("Sélectionne au moins une réponse valide.".into());
+        }
+        Value::Array(answers.into_iter().map(Value::String).collect())
+    } else {
+        if question.required && answer.is_empty() {
+            return Err("Saisis une réponse avant de continuer.".into());
+        }
+        Value::String(answer.to_string())
+    };
+    let pending = pending_questions
         .remove(&question_id)
         .ok_or_else(|| "Cette question n’existe plus ou a été annulée.".to_string())?;
     pending
         .sender
-        .send(answer)
+        .send(value)
         .map_err(|_| "La génération a été interrompue avant la réponse.".to_string())
 }
 
@@ -2229,7 +2262,11 @@ async fn execute_tool(
                         .collect()
                 })
                 .unwrap_or_default();
-            request_user_answer(app, state, session_id, question, options, cancel).await
+            request_user_answer(app, state, session_id, question, options, false, cancel)
+                .await?
+                .as_str()
+                .map(str::to_string)
+                .ok_or_else(|| "La réponse à la question est invalide.".into())
         }
         "report_progress" => {
             let summary = arguments["summary"]
@@ -2359,48 +2396,96 @@ async fn request_user_answer(
     session_id: &str,
     question: &str,
     options: Vec<String>,
+    multiple: bool,
+    cancel: watch::Receiver<bool>,
+) -> Result<Value, String> {
+    let mut answers = request_user_questions(
+        app,
+        state,
+        session_id,
+        vec![UserQuestionPrompt {
+            id: String::new(),
+            question: question.to_string(),
+            options,
+            multiple,
+            required: true,
+        }],
+        cancel,
+    )
+    .await?;
+    answers
+        .pop()
+        .ok_or_else(|| "La réponse à la question est manquante.".to_string())
+}
+
+async fn request_user_questions(
+    app: &AppHandle,
+    state: &AppState,
+    session_id: &str,
+    mut questions: Vec<UserQuestionPrompt>,
     mut cancel: watch::Receiver<bool>,
-) -> Result<String, String> {
-    let id = Uuid::new_v4().to_string();
-    let (sender, receiver) = oneshot::channel();
-    state
-        .pending_questions
-        .lock()
-        .map_err(|_| "Impossible d’accéder aux questions en attente.".to_string())?
-        .insert(
-            id.clone(),
+) -> Result<Vec<Value>, String> {
+    let mut pending_questions = Vec::with_capacity(questions.len());
+    let mut receivers = Vec::with_capacity(questions.len());
+    for question in &mut questions {
+        question.id = Uuid::new_v4().to_string();
+        let (sender, receiver) = oneshot::channel();
+        pending_questions.push((
+            question.id.clone(),
             PendingQuestion {
                 session_id: session_id.to_string(),
+                multiple: question.multiple,
+                required: question.required,
                 sender,
             },
-        );
+        ));
+        receivers.push(receiver);
+    }
+    {
+        let mut pending = state
+            .pending_questions
+            .lock()
+            .map_err(|_| "Impossible d’accéder aux questions en attente.".to_string())?;
+        pending.extend(pending_questions);
+    }
     if let Err(error) = app.emit(
         USER_QUESTION,
         UserQuestion {
-            id: id.clone(),
             session_id: session_id.to_string(),
-            question: question.to_string(),
-            options,
+            questions: questions.clone(),
         },
     ) {
-        state
+        let mut pending = state
             .pending_questions
             .lock()
-            .map_err(|_| "Impossible d’accéder aux questions en attente.".to_string())?
-            .remove(&id);
+            .map_err(|_| "Impossible d’accéder aux questions en attente.".to_string())?;
+        for question in &questions {
+            pending.remove(&question.id);
+        }
         return Err(format!("Impossible d’afficher la question : {error}"));
     }
-    let answer = tokio::select! {
-        answer = receiver => answer
-            .map_err(|_| "La question a été annulée avant la réponse.".to_string()),
-        _ = cancel.changed() => Err("La question a été annulée.".to_string()),
-    };
-    state
-        .pending_questions
-        .lock()
-        .map_err(|_| "Impossible d’accéder aux questions en attente.".to_string())?
-        .remove(&id);
-    answer
+    let mut answers = Vec::with_capacity(receivers.len());
+    for receiver in receivers {
+        let answer = tokio::select! {
+            answer = receiver => answer
+                .map_err(|_| "La question a été annulée avant la réponse.".to_string()),
+            _ = cancel.changed() => Err("La question a été annulée.".to_string()),
+        };
+        match answer {
+            Ok(answer) => answers.push(answer),
+            Err(error) => {
+                let mut pending = state
+                    .pending_questions
+                    .lock()
+                    .map_err(|_| "Impossible d’accéder aux questions en attente.".to_string())?;
+                for question in &questions {
+                    pending.remove(&question.id);
+                }
+                return Err(error);
+            }
+        }
+    }
+    Ok(answers)
 }
 
 fn emit_chat_stopped(app: &AppHandle, session_id: &str) {
@@ -2515,8 +2600,51 @@ fn emit_chat_error(app: &AppHandle, session_id: &str, message_id: &str, error: &
     );
 }
 
+async fn opencode_api_json(
+    client: &Client,
+    base_url: &str,
+    password: &str,
+    method: reqwest::Method,
+    path: &str,
+    body: Option<Value>,
+) -> Result<Value, String> {
+    let mut request = client
+        .request(method, format!("{base_url}{path}"))
+        .basic_auth("opencode", Some(password));
+    if let Some(body) = body {
+        request = request.json(&body);
+    }
+    let response = request
+        .send()
+        .await
+        .map_err(|error| format!("Impossible de communiquer avec le serveur OpenCode : {error}"))?;
+    let status = response.status();
+    let body = response
+        .bytes()
+        .await
+        .map_err(|error| format!("Impossible de lire la réponse OpenCode : {error}"))?;
+    if !status.is_success() {
+        let detail = String::from_utf8_lossy(&body);
+        let detail = detail.trim();
+        return Err(format!(
+            "Le serveur OpenCode a répondu avec le statut {status}{}",
+            if detail.is_empty() {
+                String::new()
+            } else {
+                format!(" : {}", detail.chars().take(700).collect::<String>())
+            }
+        ));
+    }
+    if body.is_empty() {
+        return Ok(Value::Null);
+    }
+    serde_json::from_slice(&body)
+        .map_err(|error| format!("Réponse JSON OpenCode invalide : {error}"))
+}
+
 async fn run_opencode_model(
     app: &AppHandle,
+    state: &AppState,
     session: &ChatSession,
     model_id: &str,
     assistant_id: &str,
@@ -2531,195 +2659,528 @@ async fn run_opencode_model(
     )>,
     OpenCodeRunFailure,
 > {
-    let model = format!("opencode/{model_id}");
+    let port_listener = TcpListener::bind(("127.0.0.1", 0)).map_err(|error| {
+        OpenCodeRunFailure::new(format!(
+            "Impossible de réserver un port local pour OpenCode : {error}"
+        ))
+    })?;
+    let port = port_listener
+        .local_addr()
+        .map_err(|error| {
+            OpenCodeRunFailure::new(format!(
+                "Impossible de déterminer le port local pour OpenCode : {error}"
+            ))
+        })?
+        .port();
+    drop(port_listener);
+
+    let password = Uuid::new_v4().to_string();
+    let base_url = format!("http://127.0.0.1:{port}");
+    let client = Client::builder()
+        .timeout(Duration::from_secs(24 * 60 * 60))
+        .build()
+        .map_err(|error| OpenCodeRunFailure::new(error.to_string()))?;
     let agent = opencode_agent_for_mode(&session.mode);
     let executable = opencode_executable().map_err(OpenCodeRunFailure::new)?;
     let command_path = opencode_command_path().map_err(OpenCodeRunFailure::new)?;
     let mut command = TokioCommand::new(executable);
     command
         .env("PATH", command_path)
+        .env("OPENCODE_SERVER_PASSWORD", &password)
+        .env("OPENCODE_SERVER_USERNAME", "opencode")
         .args([
-            "run", "--agent", agent, "--model", &model, "--format", "json",
+            "serve",
+            "--hostname",
+            "127.0.0.1",
+            "--port",
+            &port.to_string(),
         ])
-        .current_dir(&session.project_path);
-    #[cfg(windows)]
-    hide_tokio_console_window(&mut command);
-    if let Some(opencode_session_id) = session.opencode_session_id.as_deref() {
-        command.args(["--session", opencode_session_id]);
-    } else {
-        command.args(["--title", &format!("LUCY · {}", session.title)]);
-    }
-    command
-        .arg(prompt)
-        .stdout(Stdio::piped())
+        .current_dir(&session.project_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    #[cfg(windows)]
+    hide_tokio_console_window(&mut command);
     let mut child = command.spawn().map_err(|error| {
         OpenCodeRunFailure::new(format!(
             "Impossible de lancer OpenCode pour le modèle gratuit : {error}"
         ))
-    })?;
-    let stdout = child.stdout.take().ok_or_else(|| {
-        OpenCodeRunFailure::new(
-            "Impossible de lire les événements envoyés par OpenCode.".to_string(),
-        )
     })?;
     let mut stderr = child.stderr.take().ok_or_else(|| {
         OpenCodeRunFailure::new("Impossible de lire les erreurs envoyées par OpenCode.".to_string())
     })?;
     let stderr_task = tokio::spawn(async move {
         let mut bytes = Vec::new();
-        stderr.read_to_end(&mut bytes).await.map(|_| bytes)
+        tokio::io::AsyncReadExt::read_to_end(&mut stderr, &mut bytes)
+            .await
+            .map(|_| bytes)
     });
-    let run = async {
-        let mut lines = BufReader::new(stdout).lines();
-        let mut answer = String::new();
-        let mut open_session_id = None;
-        let mut run_error = None;
-        let mut started_tools = std::collections::BTreeSet::new();
-        let mut tools: Vec<OpenCodeToolEvent> = Vec::new();
-        let mut timeline = Vec::new();
-        loop {
-            let next_line = tokio::select! {
-                result = lines.next_line() => result.map_err(|error| {
-                    format!("Impossible de lire les événements OpenCode : {error}")
-                })?,
-                _ = cancel.changed() => return Ok(None),
-            };
-            let Some(line) = next_line else {
-                break;
-            };
-            if line.trim().is_empty() {
-                continue;
-            }
-            let event = parse_opencode_run_event(&line)?;
-            open_session_id = event.session_id.or(open_session_id);
-            if let Some(text) = event.text {
-                answer.push_str(&text);
-                append_opencode_text(&mut timeline, &text);
-                let _ = app.emit(
-                    CHAT_UPDATE,
-                    ChatUpdate {
-                        session_id: session.id.clone(),
-                        message_id: assistant_id.to_string(),
-                        kind: "delta".into(),
-                        delta: text,
-                        error: None,
-                        details: None,
-                    },
-                );
-            }
-            if let Some(error) = event.error {
-                run_error = Some(error);
-            }
-            if let Some(tool) = event.tool {
-                if let Some(previous) = tools.iter_mut().find(|previous| previous.id == tool.id) {
-                    *previous = OpenCodeToolEvent {
-                        id: tool.id.clone(),
-                        name: tool.name.clone(),
-                        arguments: tool.arguments.clone(),
-                        status: tool.status.clone(),
-                        result: tool.result.clone(),
-                    };
-                } else {
-                    tools.push(OpenCodeToolEvent {
-                        id: tool.id.clone(),
-                        name: tool.name.clone(),
-                        arguments: tool.arguments.clone(),
-                        status: tool.status.clone(),
-                        result: tool.result.clone(),
-                    });
-                }
-                if started_tools.insert(tool.id.clone()) {
-                    if !is_opencode_question_tool(&tool.name) {
-                        timeline.push(OpenCodeTimelineItem::Tool(tool.id.clone()));
-                        let _ = app.emit(
-                            CHAT_UPDATE,
-                            ChatUpdate {
-                                session_id: session.id.clone(),
-                                message_id: tool.id.clone(),
-                                kind: "tool_start".into(),
-                                delta: String::new(),
-                                error: None,
-                                details: Some(serde_json::json!({
-                                    "name": &tool.name,
-                                    "arguments": &tool.arguments,
-                                })),
-                            },
-                        );
-                    }
-                }
-                if !is_opencode_question_tool(&tool.name)
-                    && !matches!(tool.status.as_str(), "running" | "pending")
-                {
-                    let result = if tool.result.is_empty() && tool.status == "error" {
-                        "L’outil OpenCode a échoué.".to_string()
-                    } else {
-                        tool.result.chars().take(5_000).collect()
-                    };
-                    let _ = app.emit(
-                        CHAT_UPDATE,
-                        ChatUpdate {
-                            session_id: session.id.clone(),
-                            message_id: tool.id,
-                            kind: "tool_result".into(),
-                            delta: String::new(),
-                            error: None,
-                            details: Some(serde_json::json!({ "result": result })),
-                        },
-                    );
-                }
-            }
-        }
-        let status = tokio::select! {
-            result = child.wait() => result.map_err(|error| {
-                format!("Impossible d’attendre la fin d’OpenCode : {error}")
-            })?,
-            _ = cancel.changed() => return Ok(None),
-        };
-        Ok(Some((
-            answer,
-            open_session_id,
-            run_error,
-            status,
-            tools,
-            timeline,
-        )))
-    };
-    let output = match run.await {
-        Ok(Some(output)) => output,
-        Ok(None) => {
+    let mut ready = false;
+    for _ in 0..100 {
+        if *cancel.borrow() {
             emit_chat_stopped(app, &session.id);
             return Ok(None);
         }
-        Err(error) => return Err(OpenCodeRunFailure::new(error)),
-    };
-    let stderr = stderr_task
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let detail = stderr_task
+                    .await
+                    .ok()
+                    .and_then(Result::ok)
+                    .map(|bytes| String::from_utf8_lossy(&bytes).trim().to_string())
+                    .filter(|message| !message.is_empty())
+                    .unwrap_or_else(|| format!("OpenCode a quitté avec le statut {status}."));
+                return Err(OpenCodeRunFailure::new(format!(
+                    "Le serveur OpenCode n’a pas démarré : {detail}"
+                )));
+            }
+            Ok(None) => {}
+            Err(error) => {
+                return Err(OpenCodeRunFailure::new(format!(
+                    "Impossible de vérifier le serveur OpenCode : {error}"
+                )));
+            }
+        }
+        match client
+            .get(format!("{base_url}/api/info"))
+            .basic_auth("opencode", Some(&password))
+            .send()
+            .await
+        {
+            Ok(response) if response.status().is_success() => {
+                ready = true;
+                break;
+            }
+            Ok(_) | Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
+        }
+    }
+    if !ready {
+        return Err(OpenCodeRunFailure::new(
+            "Le serveur OpenCode local n’a pas répondu dans le délai prévu.".into(),
+        ));
+    }
+
+    let event_response = client
+        .get(format!("{base_url}/api/event"))
+        .header(header::ACCEPT, "text/event-stream")
+        .basic_auth("opencode", Some(&password))
+        .send()
         .await
         .map_err(|error| {
             OpenCodeRunFailure::new(format!(
-                "Impossible de récupérer les erreurs OpenCode : {error}"
+                "Impossible de s’abonner aux événements OpenCode : {error}"
             ))
         })?
+        .error_for_status()
         .map_err(|error| {
-            OpenCodeRunFailure::new(format!("Impossible de lire les erreurs OpenCode : {error}"))
+            OpenCodeRunFailure::new(format!(
+                "Impossible de s’abonner aux événements OpenCode : {error}"
+            ))
         })?;
-    let (answer, open_session_id, run_error, status, tools, timeline) = output;
-    if !status.success() || run_error.is_some() {
-        let detail = run_error
-            .or_else(|| {
-                let stderr = String::from_utf8_lossy(&stderr);
-                let stderr = stderr.trim();
-                (!stderr.is_empty()).then(|| stderr.chars().take(700).collect())
-            })
-            .unwrap_or_else(|| format!("OpenCode a quitté avec le statut {status}."));
-        let retry_fresh_session = session.opencode_session_id.is_some()
-            && answer.trim().is_empty()
-            && tools.is_empty()
-            && is_retryable_opencode_session_error(&detail);
+    let mut event_stream = event_response.bytes_stream();
+
+    let session_id = if let Some(id) = session.opencode_session_id.as_deref() {
+        let model_result = opencode_api_json(
+            &client,
+            &base_url,
+            &password,
+            reqwest::Method::POST,
+            &format!("/api/session/{id}/model"),
+            Some(serde_json::json!({
+                "model": { "providerID": "opencode", "modelID": model_id }
+            })),
+        )
+        .await;
+        if let Err(error) = model_result {
+            if is_retryable_opencode_session_error(&error) {
+                return Err(OpenCodeRunFailure {
+                    message: error,
+                    retry_fresh_session: true,
+                });
+            }
+            return Err(OpenCodeRunFailure::new(error));
+        }
+        opencode_api_json(
+            &client,
+            &base_url,
+            &password,
+            reqwest::Method::POST,
+            &format!("/api/session/{id}/agent"),
+            Some(serde_json::json!({ "agent": agent })),
+        )
+        .await
+        .map_err(OpenCodeRunFailure::new)?;
+        id.to_string()
+    } else {
+        let created = opencode_api_json(
+            &client,
+            &base_url,
+            &password,
+            reqwest::Method::POST,
+            "/api/session",
+            Some(serde_json::json!({
+                "title": format!("LUCY · {}", session.title),
+                "agent": agent,
+                "model": { "providerID": "opencode", "modelID": model_id },
+                "location": { "directory": session.project_path },
+            })),
+        )
+        .await
+        .map_err(OpenCodeRunFailure::new)?;
+        created["id"]
+            .as_str()
+            .ok_or_else(|| {
+                OpenCodeRunFailure::new(
+                    "OpenCode a créé une session sans renvoyer son identifiant.".into(),
+                )
+            })?
+            .to_string()
+    };
+
+    let prompt_client = client.clone();
+    let prompt_password = password.clone();
+    let prompt_base_url = base_url.clone();
+    let prompt_session_id = session_id.clone();
+    let prompt_text = prompt.to_string();
+    let prompt_task = tokio::spawn(async move {
+        opencode_api_json(
+            &prompt_client,
+            &prompt_base_url,
+            &prompt_password,
+            reqwest::Method::POST,
+            &format!("/api/session/{prompt_session_id}/prompt"),
+            Some(serde_json::json!({ "text": prompt_text })),
+        )
+        .await
+    });
+    let mut prompt_task = prompt_task;
+    let mut prompt_finished = false;
+    let mut answer = String::new();
+    let mut tools: Vec<OpenCodeToolEvent> = Vec::new();
+    let mut timeline = Vec::new();
+    let mut started_tools = std::collections::BTreeSet::new();
+    let mut line_buffer = Vec::new();
+    let mut run_error = None;
+    let mut session_idle = false;
+
+    loop {
+        if *cancel.borrow() {
+            let _ = opencode_api_json(
+                &client,
+                &base_url,
+                &password,
+                reqwest::Method::POST,
+                &format!("/api/session/{session_id}/interrupt"),
+                None,
+            )
+            .await;
+            emit_chat_stopped(app, &session.id);
+            return Ok(None);
+        }
+        tokio::select! {
+            _ = cancel.changed() => {
+                let _ = opencode_api_json(
+                    &client,
+                    &base_url,
+                    &password,
+                    reqwest::Method::POST,
+                    &format!("/api/session/{session_id}/interrupt"),
+                    None,
+                ).await;
+                emit_chat_stopped(app, &session.id);
+                return Ok(None);
+            }
+            prompt_result = &mut prompt_task, if !prompt_finished => {
+                prompt_finished = true;
+                match prompt_result {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(error)) => run_error = Some(error),
+                    Err(error) => run_error = Some(format!("La requête OpenCode a échoué : {error}")),
+                }
+            }
+            chunk = event_stream.next() => {
+                let Some(chunk) = chunk else {
+                    if prompt_finished {
+                        break;
+                    }
+                    return Err(OpenCodeRunFailure::new(
+                        "Le flux d’événements OpenCode s’est fermé pendant la génération.".into(),
+                    ));
+                };
+                let chunk = chunk.map_err(|error| OpenCodeRunFailure::new(format!(
+                    "Impossible de lire les événements OpenCode : {error}"
+                )))?;
+                line_buffer.extend_from_slice(&chunk);
+                while let Some(newline) = line_buffer.iter().position(|byte| *byte == b'\n') {
+                    let line: Vec<u8> = line_buffer.drain(..=newline).collect();
+                    let line = String::from_utf8_lossy(&line);
+                    let Some(data) = line.trim().strip_prefix("data:") else { continue };
+                    let raw = data.trim();
+                    if raw.is_empty() { continue; }
+                    let payload = parse_opencode_api_event(raw)
+                        .map_err(OpenCodeRunFailure::new)?;
+                    let event_type = payload["type"].as_str().unwrap_or_default();
+                    let properties = &payload["properties"];
+                    let event_session_id = properties["sessionID"]
+                        .as_str()
+                        .or_else(|| properties["form"]["sessionID"].as_str())
+                        .or_else(|| properties["permission"]["sessionID"].as_str())
+                        .or_else(|| properties["part"]["sessionID"].as_str())
+                        .or_else(|| properties["info"]["sessionID"].as_str())
+                        .or_else(|| properties["message"]["sessionID"].as_str())
+                        .or_else(|| payload["sessionID"].as_str());
+                    if event_session_id != Some(session_id.as_str()) { continue; }
+
+                    if event_type == "session.idle" {
+                        session_idle = true;
+                        continue;
+                    }
+                    if event_type == "session.error" {
+                        run_error = Some(
+                            properties["error"]["message"].as_str()
+                                .or_else(|| properties["message"].as_str())
+                                .unwrap_or("OpenCode a signalé une erreur pendant la génération.")
+                                .to_string(),
+                        );
+                        continue;
+                    }
+                    if event_type == "form.created" {
+                        let form = properties.get("form").unwrap_or(properties);
+                        let form_id = form["id"].as_str().ok_or_else(|| OpenCodeRunFailure::new(
+                            "OpenCode a envoyé un formulaire sans identifiant.".into()
+                        ))?;
+                        let fields = form["fields"].as_array().into_iter().flatten()
+                            .collect::<Vec<_>>();
+                        let mut form_prompts = Vec::with_capacity(fields.len());
+                        let mut form_answer_metadata = Vec::with_capacity(fields.len());
+                        for field in &fields {
+                            let key = field["key"].as_str().ok_or_else(|| OpenCodeRunFailure::new(
+                                "OpenCode a envoyé une question sans identifiant de réponse.".into()
+                            ))?;
+                            let multiple = field["type"] == "multiselect";
+                            let option_values = field["options"].as_array().into_iter().flatten()
+                                .filter_map(|option| {
+                                    let label = option["label"].as_str()?;
+                                    let value = option["value"].as_str().unwrap_or(label);
+                                    Some((label.to_string(), value.to_string()))
+                                })
+                                .take(8)
+                                .collect::<Vec<_>>();
+                            let question_text = field["description"].as_str()
+                                .filter(|description| !description.trim().is_empty())
+                                .map(|description| format!("{}\n\n{description}", field["title"].as_str().unwrap_or("Question")))
+                                .unwrap_or_else(|| field["title"].as_str().unwrap_or("Question").to_string());
+                            form_prompts.push(UserQuestionPrompt {
+                                id: String::new(),
+                                question: question_text,
+                                options: option_values.iter().map(|(label, _)| label.clone()).collect(),
+                                multiple,
+                                required: field["required"].as_bool().unwrap_or(true),
+                            });
+                            form_answer_metadata.push((key.to_string(), option_values, multiple));
+                        }
+                        if form_prompts.is_empty() {
+                            return Err(OpenCodeRunFailure::new(
+                                "OpenCode a envoyé un formulaire sans question.".into()
+                            ));
+                        }
+                        let answers = match request_user_questions(
+                            app,
+                            state,
+                            &session.id,
+                            form_prompts,
+                            cancel.clone(),
+                        ).await {
+                            Ok(answers) => answers,
+                            Err(_error) if *cancel.borrow() => {
+                                let _ = opencode_api_json(
+                                    &client,
+                                    &base_url,
+                                    &password,
+                                    reqwest::Method::POST,
+                                    &format!("/api/session/{session_id}/interrupt"),
+                                    None,
+                                ).await;
+                                emit_chat_stopped(app, &session.id);
+                                return Ok(None);
+                            }
+                            Err(error) => return Err(OpenCodeRunFailure::new(error)),
+                        };
+                        let mut form_answers = Map::new();
+                        for ((key, option_values, multiple), answer_value) in
+                            form_answer_metadata.into_iter().zip(answers)
+                        {
+                            let answer_value = if multiple {
+                                Value::Array(
+                                    answer_value.as_array().into_iter().flatten().map(|answer| {
+                                        let selected = answer.as_str().unwrap_or_default();
+                                        Value::String(option_values.iter()
+                                            .find(|(label, _)| label == selected)
+                                            .map(|(_, value)| value.clone())
+                                            .unwrap_or_else(|| selected.to_string()))
+                                    }).collect()
+                                )
+                            } else {
+                                let selected = answer_value.as_str().unwrap_or_default();
+                                Value::String(option_values.iter()
+                                    .find(|(label, _)| label == selected)
+                                    .map(|(_, value)| value.clone())
+                                    .unwrap_or_else(|| selected.to_string()))
+                            };
+                            form_answers.insert(key, answer_value);
+                        }
+                        opencode_api_json(
+                            &client,
+                            &base_url,
+                            &password,
+                            reqwest::Method::POST,
+                            &format!("/api/session/{session_id}/form/{form_id}/reply"),
+                            Some(serde_json::json!({ "answer": form_answers })),
+                        ).await.map_err(OpenCodeRunFailure::new)?;
+                        continue;
+                    }
+                    if event_type == "permission.asked" {
+                        let permission = properties
+                            .get("permission")
+                            .filter(|permission| permission.is_object())
+                            .unwrap_or(properties);
+                        let request_id = permission["id"].as_str().ok_or_else(|| OpenCodeRunFailure::new(
+                            "OpenCode a envoyé une autorisation sans identifiant.".into()
+                        ))?;
+                        let permission_name = permission["permission"].as_str().unwrap_or("outil OpenCode");
+                        let arguments = serde_json::json!({
+                            "permission": permission_name,
+                            "patterns": permission["patterns"],
+                        });
+                        let approved = match request_tool_approval(
+                            app,
+                            state,
+                            &session.id,
+                            &session.project_path,
+                            permission_name,
+                            &arguments,
+                            cancel.clone(),
+                        ).await {
+                            Ok(approved) => approved,
+                            Err(_) if *cancel.borrow() => {
+                                let _ = opencode_api_json(
+                                    &client,
+                                    &base_url,
+                                    &password,
+                                    reqwest::Method::POST,
+                                    &format!("/api/session/{session_id}/interrupt"),
+                                    None,
+                                ).await;
+                                emit_chat_stopped(app, &session.id);
+                                return Ok(None);
+                            }
+                            Err(error) => return Err(OpenCodeRunFailure::new(error)),
+                        };
+                        let allow_all = state.store.lock()
+                            .map_err(|_| OpenCodeRunFailure::new("Impossible d’accéder aux données LUCY.".into()))?
+                            .sessions.iter()
+                            .any(|stored| stored.id == session.id && stored.allow_all_tools);
+                        opencode_api_json(
+                            &client,
+                            &base_url,
+                            &password,
+                            reqwest::Method::POST,
+                            &format!("/api/session/{session_id}/permission/{request_id}/reply"),
+                            Some(serde_json::json!({
+                                "decision": if approved { if allow_all { "always" } else { "once" } } else { "reject" }
+                            })),
+                        ).await.map_err(OpenCodeRunFailure::new)?;
+                        continue;
+                    }
+                    if event_type == "message.part.updated" {
+                        let part = properties.get("part").unwrap_or(properties);
+                        if part["type"] == "text" {
+                            if let Some(text) = properties["delta"].as_str() {
+                                if !text.is_empty() {
+                                    answer.push_str(text);
+                                    append_opencode_text(&mut timeline, text);
+                                    let _ = app.emit(CHAT_UPDATE, ChatUpdate {
+                                        session_id: session.id.clone(),
+                                        message_id: assistant_id.to_string(),
+                                        kind: "delta".into(),
+                                        delta: text.to_string(),
+                                        error: None,
+                                        details: None,
+                                    });
+                                }
+                            }
+                        } else if part["type"] == "tool" {
+                            let state = &part["state"];
+                            let id = part["callID"].as_str().or_else(|| part["id"].as_str())
+                                .unwrap_or_default();
+                            let name = part["tool"].as_str().unwrap_or("outil");
+                            if !id.is_empty() {
+                                let tool = OpenCodeToolEvent {
+                                    id: id.to_string(),
+                                    name: name.to_string(),
+                                    arguments: state.get("input").cloned().unwrap_or_else(|| serde_json::json!({})),
+                                    status: state["status"].as_str().unwrap_or("running").to_string(),
+                                    result: state["output"].as_str().or_else(|| state["error"].as_str())
+                                        .unwrap_or_default().to_string(),
+                                };
+                                if let Some(previous) = tools.iter_mut().find(|previous| previous.id == tool.id) {
+                                    *previous = tool.clone();
+                                } else {
+                                    tools.push(tool.clone());
+                                }
+                                if started_tools.insert(tool.id.clone()) && !is_opencode_question_tool(&tool.name) {
+                                    timeline.push(OpenCodeTimelineItem::Tool(tool.id.clone()));
+                                    let _ = app.emit(CHAT_UPDATE, ChatUpdate {
+                                        session_id: session.id.clone(),
+                                        message_id: tool.id.clone(),
+                                        kind: "tool_start".into(),
+                                        delta: String::new(),
+                                        error: None,
+                                        details: Some(serde_json::json!({
+                                            "name": tool.name,
+                                            "arguments": tool.arguments,
+                                        })),
+                                    });
+                                }
+                                if !is_opencode_question_tool(&tool.name)
+                                    && !matches!(tool.status.as_str(), "running" | "pending")
+                                {
+                                    let result = if tool.result.is_empty() && tool.status == "error" {
+                                        "L’outil OpenCode a échoué.".to_string()
+                                    } else {
+                                        tool.result.chars().take(5_000).collect()
+                                    };
+                                    let _ = app.emit(CHAT_UPDATE, ChatUpdate {
+                                        session_id: session.id.clone(),
+                                        message_id: tool.id,
+                                        kind: "tool_result".into(),
+                                        delta: String::new(),
+                                        error: None,
+                                        details: Some(serde_json::json!({ "result": result })),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if prompt_finished && session_idle {
+            break;
+        }
+        if prompt_finished && run_error.is_some() {
+            break;
+        }
+    }
+
+    if let Some(error) = run_error {
         return Err(OpenCodeRunFailure {
-            message: format!("Le moteur OpenCode a échoué : {detail}"),
-            retry_fresh_session,
+            retry_fresh_session: session.opencode_session_id.is_some()
+                && answer.trim().is_empty()
+                && tools.is_empty()
+                && is_retryable_opencode_session_error(&error),
+            message: format!("Le moteur OpenCode a échoué : {error}"),
         });
     }
     if answer.trim().is_empty()
@@ -2731,7 +3192,7 @@ async fn run_opencode_model(
             "OpenCode a terminé sans renvoyer de réponse textuelle.".into(),
         ));
     }
-    Ok(Some((answer, open_session_id, tools, timeline)))
+    Ok(Some((answer, Some(session_id), tools, timeline)))
 }
 
 #[tauri::command]
@@ -3459,6 +3920,7 @@ async fn send_message(
         )?;
         let run = run_opencode_model(
             &app,
+            &state,
             &session,
             &request_model_id,
             &assistant_id,
@@ -3492,6 +3954,7 @@ async fn send_message(
                 )?;
                 run_opencode_model(
                     &app,
+                    &state,
                     &fresh_session,
                     &request_model_id,
                     &assistant_id,
@@ -3565,6 +4028,7 @@ async fn send_message(
                         &session_id,
                         &question.question,
                         question.options,
+                        false,
                         cancel.clone(),
                     )
                     .await?;
@@ -3574,7 +4038,12 @@ async fn send_message(
                     .iter()
                     .enumerate()
                     .map(|(index, (question, answer))| {
-                        format!("{}. {} : {}", index + 1, question, answer)
+                        format!(
+                            "{}. {} : {}",
+                            index + 1,
+                            question,
+                            answer.as_str().unwrap_or_default()
+                        )
                     })
                     .collect::<Vec<_>>()
                     .join("\n");
@@ -3618,6 +4087,7 @@ async fn send_message(
             );
             run = run_opencode_model(
                 &app,
+                &state,
                 &session,
                 &request_model_id,
                 &assistant_id,
@@ -5025,6 +5495,25 @@ mod tests {
         assert_eq!(tool.arguments["command"], "touch file.txt");
         assert_eq!(tool.status, "completed");
         assert_eq!(tool.result, "created");
+    }
+
+    #[test]
+    fn parses_opencode_api_event_payloads() {
+        let payload = serde_json::json!({
+            "type": "form.created",
+            "properties": { "form": { "id": "form-1" } }
+        });
+        let wrapped = serde_json::json!({
+            "directory": "/project",
+            "payload": payload
+        });
+        let direct = parse_opencode_api_event(&wrapped.to_string()).unwrap();
+        assert_eq!(direct["type"], "form.created");
+        assert_eq!(direct["properties"]["form"]["id"], "form-1");
+
+        let encoded = serde_json::to_string(&wrapped.to_string()).unwrap();
+        let decoded = parse_opencode_api_event(&encoded).unwrap();
+        assert_eq!(decoded, direct);
     }
 
     #[test]

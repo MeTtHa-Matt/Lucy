@@ -1342,6 +1342,66 @@ details.tool-card summary {
     inset 0 1px rgba(255, 100, 128, 0.08);
 }
 
+.question-list {
+  display: grid;
+  gap: 16px;
+  max-height: min(54vh, 580px);
+  margin: 12px -4px 16px 0;
+  padding: 2px 8px 2px 0;
+  overflow-y: auto;
+}
+
+.question-item {
+  min-width: 0;
+  padding: 14px;
+  border: 1px solid #38232d;
+  background: rgba(10, 8, 11, 0.52);
+}
+
+.question-item + .question-item {
+  border-color: #4a2935;
+}
+
+.question-item h3 {
+  margin: 0;
+  color: #f0dce2;
+  font: 600 14px/1.5 var(--sans);
+  white-space: pre-line;
+}
+
+.question-item-index {
+  margin-bottom: 7px;
+  color: #e36b83;
+  font: 8px var(--mono);
+  letter-spacing: 0.12em;
+}
+
+.question-item-index span {
+  color: #9e8990;
+}
+
+.question-item .question-options {
+  margin: 12px 0;
+}
+
+.question-item .field-label {
+  display: block;
+  margin: 8px 0;
+  color: #ed778b;
+}
+
+.question-keyboard-hint,
+.question-required-hint {
+  display: block;
+  margin: 8px 0 0;
+  color: #ad929b;
+  font: 9px/1.5 var(--mono);
+}
+
+.question-required-hint {
+  color: #f18496;
+}
+
 .question-modal textarea {
   width: 100%;
   min-height: 91.2px;

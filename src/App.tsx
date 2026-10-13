@@ -45,11 +45,25 @@ type ToolApproval = {
   arguments: Record<string, unknown>;
 };
 type UserQuestion = {
-  id: string;
   sessionId: string;
-  question: string;
-  options: string[];
+  questions: {
+    id: string;
+    question: string;
+    options: string[];
+    multiple: boolean;
+    required: boolean;
+  }[];
 };
+
+function selectedQuestionAnswers(answer: string): string[] {
+  try {
+    const parsed: unknown = JSON.parse(answer);
+    return Array.isArray(parsed) ? parsed.filter((value): value is string => typeof value === "string") : [];
+  } catch {
+    return answer.split(",").map((value) => value.trim()).filter(Boolean);
+  }
+}
+
 type ContextUsage = {
   modelId: string;
   usedTokens: number;
@@ -272,8 +286,8 @@ function App() {
   const [shellCommand, setShellCommand] = useState("");
   const [pendingApproval, setPendingApproval] = useState<ToolApproval | null>(null);
   const [pendingQuestion, setPendingQuestion] = useState<UserQuestion | null>(null);
-  const [questionAnswer, setQuestionAnswer] = useState("");
-  const [questionOtherSelected, setQuestionOtherSelected] = useState(false);
+  const [questionAnswers, setQuestionAnswers] = useState<Record<string, string>>({});
+  const [questionOtherSelected, setQuestionOtherSelected] = useState<Record<string, boolean>>({});
   const [liveTimeline, setLiveTimeline] = useState<TimelineSegment[]>([]);
   const [projectContext, setProjectContext] = useState<ProjectContext | null>(null);
   const [contextLoading, setContextLoading] = useState(false);
@@ -735,8 +749,14 @@ function App() {
     void listen<UserQuestion>("user:question", (event) => {
       if (event.payload.sessionId !== sessionId) return;
       setPendingQuestion(event.payload);
-      setQuestionAnswer("");
-      setQuestionOtherSelected(event.payload.options.length === 0);
+      setQuestionAnswers(Object.fromEntries(event.payload.questions.map((question) => [
+        question.id,
+        question.multiple ? "[]" : "",
+      ])));
+      setQuestionOtherSelected(Object.fromEntries(event.payload.questions.map((question) => [
+        question.id,
+        question.options.length === 0,
+      ])));
     }).then((dispose) => { unlisten = dispose; });
     return () => unlisten?.();
   }, [sessionId]);
@@ -892,7 +912,8 @@ function App() {
     setProjectContext(null);
     setContextLoading(false);
     setPendingQuestion(null);
-    setQuestionAnswer("");
+    setQuestionAnswers({});
+    setQuestionOtherSelected({});
     setError("");
   };
 
@@ -1318,19 +1339,54 @@ function App() {
 
   const submitQuestionAnswer = async (event: React.FormEvent) => {
     event.preventDefault();
-    if (!pendingQuestion || !questionAnswer.trim()) return;
+    if (!pendingQuestion || pendingQuestion.questions.some((question) => {
+      const answer = questionAnswers[question.id] ?? "";
+      return question.required && (question.multiple
+        ? selectedQuestionAnswers(answer).length === 0
+        : !answer.trim());
+    })) return;
     try {
-      await invoke("answer_user_question", {
-        questionId: pendingQuestion.id,
-        answer: questionAnswer.trim(),
-      });
+      await Promise.all(pendingQuestion.questions.map((question) => {
+        const answer = questionAnswers[question.id] ?? "";
+        return invoke("answer_user_question", {
+          questionId: question.id,
+          answer: question.multiple
+            ? JSON.stringify(selectedQuestionAnswers(answer))
+            : answer.trim(),
+        });
+      }));
       setPendingQuestion(null);
-      setQuestionAnswer("");
-      setQuestionOtherSelected(false);
+      setQuestionAnswers({});
+      setQuestionOtherSelected({});
       setError("");
     } catch (reason) {
       setError(friendlyError(reason));
     }
+  };
+
+  const handleQuestionKeyDown = (event: React.KeyboardEvent<HTMLFormElement>) => {
+    if (!["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) return;
+    const target = event.target;
+    if (!(target instanceof HTMLElement)) return;
+    const group = target.closest(".question-options");
+    if (!group) return;
+    const options = Array.from(group.querySelectorAll<HTMLButtonElement>("button:not(:disabled)"));
+    if (!options.length) return;
+    const button = target.closest("button");
+    if (!button) return;
+    const index = options.indexOf(button);
+    if (index < 0) return;
+    event.preventDefault();
+    const nextIndex = event.key === "Home" ? 0
+      : event.key === "End" ? options.length - 1
+        : (index + (event.key === "ArrowDown" ? 1 : options.length - 1)) % options.length;
+    options[nextIndex]?.focus();
+  };
+
+  const handleQuestionTextareaKeyDown = (event: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (event.key !== "Enter" || event.shiftKey || event.nativeEvent.isComposing) return;
+    event.preventDefault();
+    event.currentTarget.form?.requestSubmit();
   };
 
   useEffect(() => {
@@ -1987,52 +2043,112 @@ function App() {
       </div>}
 
       {pendingQuestion && <div className="modal-backdrop approval-backdrop">
-        <form className="modal-card question-modal" onSubmit={(event) => void submitQuestionAnswer(event)} role="dialog" aria-modal="true" aria-labelledby="question-title">
+        <form className="modal-card question-modal" onSubmit={(event) => void submitQuestionAnswer(event)} onKeyDown={handleQuestionKeyDown} role="dialog" aria-modal="true" aria-labelledby="question-title">
           <div className="modal-kicker">PRÉCISION // LUCY A BESOIN DE TON AVIS</div>
-          <h2 id="question-title">{pendingQuestion.question}</h2>
-          <p>Ta réponse permettra à Lucy de poursuivre sans faire de suppositions.</p>
-          {pendingQuestion.options.length > 0 && <>
-            <div className="question-options" role="group" aria-label="Réponses proposées">
-              {pendingQuestion.options.map((option, index) => <button
-                key={option}
-                type="button"
-                className={questionAnswer === option && !questionOtherSelected ? "selected" : ""}
-                aria-pressed={questionAnswer === option && !questionOtherSelected}
-                onClick={() => {
-                  setQuestionAnswer(option);
-                  setQuestionOtherSelected(false);
-                }}
-              >
-                <span className="question-option-index">{String(index + 1).padStart(2, "0")}</span>
-                <span className="question-option-copy">{option}</span>
-                <span className="question-option-mark" aria-hidden="true">↵</span>
-              </button>)}
-              <button
-                type="button"
-                className={`question-option-other ${questionOtherSelected ? "selected" : ""}`}
-                aria-pressed={questionOtherSelected}
-                onClick={() => {
-                  setQuestionAnswer("");
-                  setQuestionOtherSelected(true);
-                }}
-              >
-                <span className="question-option-index" aria-hidden="true">✎</span>
-                <span className="question-option-copy">Autre</span>
-                <span className="question-option-mark" aria-hidden="true">＋</span>
-              </button>
-            </div>
-            {questionOtherSelected && <>
-              <label className="field-label" htmlFor="question-answer">TA RÉPONSE PERSONNALISÉE</label>
-              <textarea id="question-answer" autoFocus value={questionAnswer} onChange={(event) => setQuestionAnswer(event.target.value)} maxLength={2_000} rows={3} required placeholder="Écris ta réponse…" />
-            </>}
-          </>}
-          {pendingQuestion.options.length === 0 && <>
-            <label className="field-label" htmlFor="question-answer">TA RÉPONSE</label>
-            <textarea id="question-answer" autoFocus value={questionAnswer} onChange={(event) => setQuestionAnswer(event.target.value)} maxLength={2_000} rows={3} required />
-          </>}
+          <h2 id="question-title">{pendingQuestion.questions.length > 1
+            ? "Répondre aux questions"
+            : "LUCY A BESOIN D’UNE PRÉCISION"}</h2>
+          <p>Flèches ↑/↓ pour parcourir les choix, Tab pour naviguer ; Entrée valide. Maj+Entrée ajoute une ligne dans « Autre ».</p>
+          <div className="question-list">
+            {pendingQuestion.questions.map((question, questionIndex) => {
+              const answer = questionAnswers[question.id] ?? "";
+              const isOtherSelected = questionOtherSelected[question.id] ?? false;
+              const selected = selectedQuestionAnswers(answer);
+              const questionLabelId = `question-label-${question.id}`;
+              const answerIsMissing = question.required && (question.multiple
+                ? selected.length === 0
+                : !answer.trim());
+              return <section className="question-item" key={question.id} aria-labelledby={questionLabelId}>
+                {pendingQuestion.questions.length > 1 && <div className="question-item-index">
+                  QUESTION {questionIndex + 1} / {pendingQuestion.questions.length}
+                  {!question.required && <span> FACULTATIVE</span>}
+                </div>}
+                <h3 id={questionLabelId}>{question.question}</h3>
+                {question.options.length > 0 && <>
+                  <div className="question-options" role="group" aria-label={`Choix pour la question ${questionIndex + 1}`}>
+                    {question.options.map((option, index) => {
+                      const optionSelected = question.multiple ? selected.includes(option) : answer === option;
+                      return <button
+                        key={option}
+                        type="button"
+                        autoFocus={questionIndex === 0 && index === 0}
+                        className={optionSelected && !isOtherSelected ? "selected" : ""}
+                        aria-pressed={optionSelected && !isOtherSelected}
+                        onClick={() => {
+                          if (question.multiple) {
+                            setQuestionAnswers((current) => ({
+                              ...current,
+                              [question.id]: JSON.stringify(optionSelected
+                                ? selected.filter((value) => value !== option)
+                                : [...selected, option]),
+                            }));
+                          } else {
+                            setQuestionAnswers((current) => ({ ...current, [question.id]: option }));
+                            setQuestionOtherSelected((current) => ({ ...current, [question.id]: false }));
+                          }
+                        }}
+                      >
+                        <span className="question-option-index">{String(index + 1).padStart(2, "0")}</span>
+                        <span className="question-option-copy">{option}</span>
+                        <span className="question-option-mark" aria-hidden="true">{question.multiple ? "✓" : "↵"}</span>
+                      </button>;
+                    })}
+                    {!question.multiple && <button
+                      type="button"
+                      className={`question-option-other ${isOtherSelected ? "selected" : ""}`}
+                      aria-pressed={isOtherSelected}
+                      onClick={() => {
+                        setQuestionAnswers((current) => ({ ...current, [question.id]: "" }));
+                        setQuestionOtherSelected((current) => ({ ...current, [question.id]: true }));
+                      }}
+                    >
+                      <span className="question-option-index" aria-hidden="true">✎</span>
+                      <span className="question-option-copy">Autre</span>
+                      <span className="question-option-mark" aria-hidden="true">＋</span>
+                    </button>}
+                  </div>
+                  {question.multiple && <p className="question-keyboard-hint">Tu peux sélectionner plusieurs choix.</p>}
+                  {isOtherSelected && !question.multiple && <>
+                    <label className="field-label" htmlFor={`question-answer-${question.id}`}>TA RÉPONSE PERSONNALISÉE</label>
+                    <textarea
+                      id={`question-answer-${question.id}`}
+                      autoFocus={questionIndex === 0 && isOtherSelected}
+                      value={answer}
+                      onChange={(event) => setQuestionAnswers((current) => ({ ...current, [question.id]: event.target.value }))}
+                      onKeyDown={handleQuestionTextareaKeyDown}
+                      maxLength={2_000}
+                      rows={3}
+                      required={question.required}
+                      placeholder="Entrée pour envoyer · Maj+Entrée pour une nouvelle ligne"
+                    />
+                  </>}
+                </>}
+                {question.options.length === 0 && <>
+                  <label className="field-label" htmlFor={`question-answer-${question.id}`}>TA RÉPONSE</label>
+                  <textarea
+                    id={`question-answer-${question.id}`}
+                    autoFocus={questionIndex === 0}
+                    value={answer}
+                    onChange={(event) => setQuestionAnswers((current) => ({ ...current, [question.id]: event.target.value }))}
+                    onKeyDown={handleQuestionTextareaKeyDown}
+                    maxLength={2_000}
+                    rows={3}
+                    required={question.required}
+                    placeholder="Entrée pour envoyer · Maj+Entrée pour une nouvelle ligne"
+                  />
+                </>}
+                {answerIsMissing && <span className="question-required-hint">Réponse requise</span>}
+              </section>;
+            })}
+          </div>
           <div className="modal-actions">
             <button className="reject-button" type="button" onClick={() => void stopGeneration()}>ARRÊTER</button>
-            <button className="approve-button" type="submit" disabled={!questionAnswer.trim()}>RÉPONDRE ET CONTINUER ↗</button>
+            <button className="approve-button" type="submit" disabled={pendingQuestion.questions.some((question) => {
+              const answer = questionAnswers[question.id] ?? "";
+              return question.required && (question.multiple
+                ? selectedQuestionAnswers(answer).length === 0
+                : !answer.trim());
+            })}>RÉPONDRE ET CONTINUER ↗</button>
           </div>
         </form>
       </div>}
