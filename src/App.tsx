@@ -102,20 +102,75 @@ const localCommands = [
   { name: "terminal", description: "Ouvrir un terminal local avec confirmation" },
 ];
 
+const toolNameLabels: Record<string, string> = {
+  ask_user: "Question à l’utilisateur",
+  bash: "Commande terminal",
+  edit: "Modification de fichier",
+  glob: "Recherche de fichiers",
+  grep: "Recherche dans les fichiers",
+  list: "Liste du dossier",
+  list_files: "Liste du dossier",
+  read: "Lecture de fichier",
+  read_file: "Lecture de fichier",
+  read_skill: "Lecture d’un skill",
+  report_progress: "Avancement",
+  run_shell: "Commande terminal",
+  task: "Tâche déléguée",
+  webfetch: "Lecture d’une page web",
+  websearch: "Recherche web",
+  write: "Écriture de fichier",
+  write_file: "Écriture de fichier",
+};
+const toolArgumentLabels: Record<string, string> = {
+  command: "Commande",
+  content: "Contenu",
+  description: "Description",
+  filePath: "Fichier",
+  file_path: "Fichier",
+  include: "Filtre",
+  limit: "Limite",
+  name: "Nom",
+  newString: "Nouveau contenu",
+  new_string: "Nouveau contenu",
+  offset: "Départ",
+  oldString: "Ancien contenu",
+  old_string: "Ancien contenu",
+  options: "Choix proposés",
+  path: "Chemin",
+  pattern: "Motif",
+  question: "Question",
+  query: "Recherche",
+  summary: "Résumé",
+  url: "Adresse",
+};
+
+const formatToolName = (name: string) => toolNameLabels[name.toLowerCase()] ??
+  name.replace(/[_-]+/g, " ").replace(/\b\w/g, (letter) => letter.toUpperCase());
+
+const formatToolValue = (value: unknown): string => {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return Number.isInteger(value) ? String(value) : String(value);
+  }
+  if (Array.isArray(value)) return value.map(formatToolValue).join("\n");
+  if (value && typeof value === "object") return JSON.stringify(value, null, 2);
+  if (typeof value === "boolean") return value ? "Oui" : "Non";
+  return String(value ?? "");
+};
+
 const formatToolArguments = (tool: ToolActivity) => {
   const args = tool.arguments;
-  if (tool.name === "run_shell" || tool.name === "bash") {
-    return String(args.command ?? "");
-  }
-  if (tool.name === "edit") {
-    const path = String(args.path ?? args.filePath ?? "");
-    const oldText = String(args.oldString ?? args.old_string ?? "");
-    const newText = String(args.newString ?? args.new_string ?? "");
-    if (oldText || newText) {
-      return `Fichier : ${path}\n\n− Ancien contenu\n${oldText}\n\n+ Nouveau contenu\n${newText}`;
-    }
-  }
-  return JSON.stringify(args, null, 2);
+  const entries = Object.entries(args).filter(([, value]) => value !== undefined && value !== null && value !== "");
+  if (entries.length === 0) return "Aucun paramètre";
+  return entries.map(([key, value]) => {
+    const label = key === "path" && ["edit", "write", "write_file"].includes(tool.name.toLowerCase())
+      ? "Fichier"
+      : toolArgumentLabels[key] ?? key.replace(/[_-]+/g, " ").replace(/\b\w/g, (letter) => letter.toUpperCase());
+    const numericValue = ["offset", "limit"].includes(key) ? Number(value) : Number.NaN;
+    const renderedValue = Number.isFinite(numericValue) && String(value).trim() !== ""
+      ? String(numericValue)
+      : formatToolValue(value);
+    return `${label} :\n${renderedValue}`;
+  }).join("\n\n");
 };
 
 const friendlyError = (error: unknown) => error instanceof Error ? error.message : String(error);
@@ -1344,7 +1399,7 @@ function App() {
                           <p>{String(segment.tool.arguments.summary ?? "")}</p>
                         </aside>
                         : <details key={segment.tool.id} className={`tool-activity ${segment.tool.result !== undefined ? "complete" : ""}`} open>
-                          <summary><span>{segment.tool.result !== undefined ? "✓" : "◌"}</span>{segment.tool.name === "ask_user" ? "Question posée" : segment.tool.name}</summary>
+                          <summary><span>{segment.tool.result !== undefined ? "✓" : "◌"}</span>{formatToolName(segment.tool.name)}</summary>
                           <pre>{formatToolArguments(segment.tool)}</pre>
                           {segment.tool.result?.trim() && <pre className="tool-result">{segment.tool.result}</pre>}
                         </details>)}

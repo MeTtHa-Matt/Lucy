@@ -2320,6 +2320,7 @@ summary,
 }
 
 .app-shell {
+  zoom: 1.25;
   width: 80%;
   height: 80vh;
   overflow: hidden;
@@ -2327,8 +2328,6 @@ summary,
   border-radius: 18px;
   background: #0b0a0d;
   box-shadow: inset 0 1px rgba(255, 255, 255, 0.025), 0 0 32px rgba(56, 10, 28, 0.14);
-  transform: scale(1.25);
-  transform-origin: top left;
 }
 
 .titlebar {
