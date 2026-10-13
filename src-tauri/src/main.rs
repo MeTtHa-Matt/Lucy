@@ -2777,18 +2777,7 @@ async fn import_opencode_providers(state: State<'_, AppState>) -> Result<PublicS
                 },
             }
         }
-        output => match read_opencode_auth_file()? {
-            Some(credentials) => credentials,
-            None => {
-                let detail = match output {
-                    Ok(output) => String::from_utf8_lossy(&output.stderr).trim().to_owned(),
-                    Err(error) => error.to_string(),
-                };
-                return Err(format!(
-                    "Impossible d’importer les comptes OpenCode : `opencode auth export` est indisponible ({detail}) et aucun fichier local auth.json compatible n’a été trouvé. Tu peux ajouter une API compatible OpenAI ou Ollama directement."
-                ));
-            }
-        },
+        _ => read_opencode_auth_file()?.unwrap_or_default(),
     };
     let mut imported_providers = Vec::new();
     for value in &exported {
