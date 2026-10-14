@@ -1109,6 +1109,12 @@ struct OpenCodeQuestion {
     options: Vec<String>,
 }
 
+struct OpenCodeFormAnswer {
+    key: String,
+    options: Vec<(String, String)>,
+    multiple: bool,
+}
+
 #[cfg(test)]
 struct OpenCodeRunEvent {
     session_id: Option<String>,
@@ -2633,6 +2639,183 @@ async fn opencode_api_json(
         .map_err(|error| format!("Réponse JSON OpenCode invalide : {error}"))
 }
 
+fn start_opencode_wait_task(
+    client: Client,
+    base_url: String,
+    password: String,
+    session_id: String,
+) -> tokio::task::JoinHandle<Result<Value, String>> {
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        opencode_api_json(
+            &client,
+            &base_url,
+            &password,
+            reqwest::Method::POST,
+            &format!("/api/experimental/session/{session_id}/wait"),
+            None,
+        )
+        .await
+    })
+}
+
+fn restart_opencode_wait_task(
+    wait_task: &mut Option<tokio::task::JoinHandle<Result<Value, String>>>,
+    session_idle: &mut bool,
+    client: &Client,
+    base_url: &str,
+    password: &str,
+    session_id: &str,
+) {
+    if let Some(wait_task) = wait_task.take() {
+        wait_task.abort();
+    }
+    *session_idle = false;
+    *wait_task = Some(start_opencode_wait_task(
+        client.clone(),
+        base_url.to_string(),
+        password.to_string(),
+        session_id.to_string(),
+    ));
+}
+
+fn opencode_form_prompts(
+    form: &Value,
+) -> Result<(String, Vec<UserQuestionPrompt>, Vec<OpenCodeFormAnswer>), String> {
+    let form_id = form["id"]
+        .as_str()
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| "OpenCode a envoyé un formulaire sans identifiant.".to_string())?
+        .to_string();
+    let fields = form["fields"].as_array().ok_or_else(|| {
+        "Le formulaire OpenCode ne contient pas de liste de questions.".to_string()
+    })?;
+    let mut prompts = Vec::with_capacity(fields.len());
+    let mut answers = Vec::with_capacity(fields.len());
+    for field in fields {
+        if field["hidden"].as_bool().unwrap_or(false) {
+            continue;
+        }
+        let key = field["key"]
+            .as_str()
+            .filter(|key| !key.is_empty())
+            .ok_or_else(|| {
+                "OpenCode a envoyé une question sans identifiant de réponse.".to_string()
+            })?
+            .to_string();
+        let multiple = field["type"] == "multiselect";
+        let options = field["options"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|option| {
+                let label = option["label"].as_str()?;
+                let value = option["value"].as_str().unwrap_or(label);
+                Some((label.to_string(), value.to_string()))
+            })
+            .take(8)
+            .collect::<Vec<_>>();
+        let title = field["title"].as_str().unwrap_or("Question");
+        let question = field["description"]
+            .as_str()
+            .filter(|description| !description.trim().is_empty())
+            .map(|description| format!("{title}\n\n{description}"))
+            .unwrap_or_else(|| title.to_string());
+        prompts.push(UserQuestionPrompt {
+            id: String::new(),
+            question,
+            options: options.iter().map(|(label, _)| label.clone()).collect(),
+            multiple,
+            required: field["required"].as_bool().unwrap_or(true),
+        });
+        answers.push(OpenCodeFormAnswer {
+            key,
+            options,
+            multiple,
+        });
+    }
+    if prompts.is_empty() {
+        return Err("OpenCode a envoyé un formulaire sans question visible.".into());
+    }
+    Ok((form_id, prompts, answers))
+}
+
+async fn answer_opencode_form(
+    app: &AppHandle,
+    state: &AppState,
+    client: &Client,
+    base_url: &str,
+    password: &str,
+    opencode_session_id: &str,
+    lucy_session_id: &str,
+    form: &Value,
+    cancel: watch::Receiver<bool>,
+) -> Result<bool, String> {
+    let (form_id, prompts, answer_metadata) = opencode_form_prompts(form)?;
+    let answers =
+        match request_user_questions(app, state, lucy_session_id, prompts, cancel.clone()).await {
+            Ok(answers) => answers,
+            Err(_) if *cancel.borrow() => {
+                opencode_api_json(
+                    client,
+                    base_url,
+                    password,
+                    reqwest::Method::POST,
+                    &format!("/api/session/{opencode_session_id}/interrupt"),
+                    None,
+                )
+                .await?;
+                emit_chat_stopped(app, lucy_session_id);
+                return Ok(false);
+            }
+            Err(error) => return Err(error),
+        };
+    let mut form_answers = Map::new();
+    for (metadata, answer) in answer_metadata.into_iter().zip(answers) {
+        let value = if metadata.multiple {
+            Value::Array(
+                answer
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(|answer| {
+                        let selected = answer.as_str().unwrap_or_default();
+                        Value::String(
+                            metadata
+                                .options
+                                .iter()
+                                .find(|(label, _)| label == selected)
+                                .map(|(_, value)| value.clone())
+                                .unwrap_or_else(|| selected.to_string()),
+                        )
+                    })
+                    .collect(),
+            )
+        } else {
+            let selected = answer.as_str().unwrap_or_default();
+            Value::String(
+                metadata
+                    .options
+                    .iter()
+                    .find(|(label, _)| label == selected)
+                    .map(|(_, value)| value.clone())
+                    .unwrap_or_else(|| selected.to_string()),
+            )
+        };
+        form_answers.insert(metadata.key, value);
+    }
+    opencode_api_json(
+        client,
+        base_url,
+        password,
+        reqwest::Method::POST,
+        &format!("/api/session/{opencode_session_id}/form/{form_id}/reply"),
+        Some(serde_json::json!({ "answer": form_answers })),
+    )
+    .await?;
+    Ok(true)
+}
+
 fn opencode_session_id(response: &Value) -> Result<String, String> {
     response
         .get("data")
@@ -3192,6 +3375,10 @@ async fn run_opencode_model(
     let mut run_error = None;
     let mut session_idle = false;
     let mut generation_started = false;
+    let mut handled_forms = std::collections::BTreeSet::new();
+    let mut empty_wait_completions = 0;
+    let mut awaiting_resume = false;
+    let mut resume_deadline = None;
     let mut tool_poll = tokio::time::interval(Duration::from_millis(150));
     tool_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -3227,20 +3414,12 @@ async fn run_opencode_model(
                 match prompt_result {
                     Ok(Ok(_)) => {
                         generation_started = true;
-                        let wait_client = client.clone();
-                        let wait_base_url = base_url.clone();
-                        let wait_password = password.clone();
-                        let wait_session_id = session_id.clone();
-                        wait_task = Some(tokio::spawn(async move {
-                            opencode_api_json(
-                                &wait_client,
-                                &wait_base_url,
-                                &wait_password,
-                                reqwest::Method::POST,
-                                &format!("/api/experimental/session/{wait_session_id}/wait"),
-                                None,
-                            ).await
-                        }));
+                        wait_task = Some(start_opencode_wait_task(
+                            client.clone(),
+                            base_url.clone(),
+                            password.clone(),
+                            session_id.clone(),
+                        ));
                     }
                     Ok(Err(error)) => run_error = Some(error),
                     Err(error) => run_error = Some(format!("La requête OpenCode a échoué : {error}")),
@@ -3253,10 +3432,97 @@ async fn run_opencode_model(
                 }
             }, if wait_task.is_some() => {
                 match wait_result {
-                    Some(Ok(Ok(_))) => session_idle = true,
+                    Some(Ok(Ok(_))) => {
+                        let forms = opencode_api_json(
+                            &client,
+                            &base_url,
+                            &password,
+                            reqwest::Method::GET,
+                            &format!("/api/session/{session_id}/form"),
+                            None,
+                        ).await;
+                        match forms {
+                            Ok(forms) => {
+                                if let Some(form) = forms["data"]
+                                    .as_array()
+                                    .into_iter()
+                                    .flatten()
+                                    .find(|form| {
+                                        form["id"].as_str().is_some_and(|id| !handled_forms.contains(id))
+                                    })
+                                {
+                                    let form_id = form["id"].as_str().unwrap_or_default().to_string();
+                                    handled_forms.insert(form_id);
+                                    if !answer_opencode_form(
+                                        app,
+                                        state,
+                                        &client,
+                                        &base_url,
+                                        &password,
+                                        &session_id,
+                                        &session.id,
+                                        form,
+                                        cancel.clone(),
+                                    ).await.map_err(OpenCodeRunFailure::new)? {
+                                        return Ok(None);
+                                    }
+                                    empty_wait_completions = 0;
+                                    awaiting_resume = true;
+                                    resume_deadline = Some(
+                                        tokio::time::Instant::now() + Duration::from_secs(30),
+                                    );
+                                    restart_opencode_wait_task(
+                                        &mut wait_task,
+                                        &mut session_idle,
+                                        &client,
+                                        &base_url,
+                                        &password,
+                                        &session_id,
+                                    );
+                                } else {
+                                    if awaiting_resume {
+                                        if resume_deadline
+                                            .is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
+                                        {
+                                            run_error = Some(
+                                                "OpenCode n’a pas repris après la réponse au formulaire.".into(),
+                                            );
+                                        } else {
+                                            restart_opencode_wait_task(
+                                                &mut wait_task,
+                                                &mut session_idle,
+                                                &client,
+                                                &base_url,
+                                                &password,
+                                                &session_id,
+                                            );
+                                        }
+                                    } else {
+                                        empty_wait_completions += 1;
+                                        if empty_wait_completions >= 3 {
+                                            session_idle = true;
+                                        } else {
+                                            restart_opencode_wait_task(
+                                                &mut wait_task,
+                                                &mut session_idle,
+                                                &client,
+                                                &base_url,
+                                                &password,
+                                                &session_id,
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                            Err(error) => run_error = Some(error),
+                        }
+                    }
                     Some(Ok(Err(error))) => run_error = Some(error),
                     Some(Err(error)) => run_error = Some(format!("L’attente de la fin OpenCode a échoué : {error}")),
                     None => {}
+                }
+                if !session_idle && run_error.is_none() && wait_task.is_some() {
+                    continue;
                 }
                 wait_task = None;
             }
@@ -3276,6 +3542,8 @@ async fn run_opencode_model(
                             started_at,
                             &mut seen_text_parts,
                         ) {
+                            awaiting_resume = false;
+                            resume_deadline = None;
                             emit_opencode_text_update(
                                 app,
                                 &session.id,
@@ -3286,6 +3554,16 @@ async fn run_opencode_model(
                             );
                         }
                         let (polled_tools, _) = opencode_timeline_from_messages(&messages, started_at);
+                        if awaiting_resume
+                            && polled_tools.iter().any(|tool| {
+                                !is_opencode_question_tool(&tool.name)
+                                    && !started_tools.contains(&tool.id)
+                            })
+                        {
+                            awaiting_resume = false;
+                            resume_deadline = None;
+                            empty_wait_completions = 0;
+                        }
                         for tool in polled_tools {
                             emit_opencode_tool_update(
                                 app,
@@ -3295,6 +3573,52 @@ async fn run_opencode_model(
                                 &mut timeline,
                                 &mut started_tools,
                                 &mut completed_tools,
+                            );
+                        }
+                    }
+                    if let Ok(forms) = opencode_api_json(
+                        &client,
+                        &base_url,
+                        &password,
+                        reqwest::Method::GET,
+                        &format!("/api/session/{session_id}/form"),
+                        None,
+                    ).await {
+                        if let Some(form) = forms["data"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .find(|form| {
+                                form["id"].as_str().is_some_and(|id| !handled_forms.contains(id))
+                            })
+                        {
+                            let form_id = form["id"].as_str().unwrap_or_default().to_string();
+                            handled_forms.insert(form_id);
+                            if !answer_opencode_form(
+                                app,
+                                state,
+                                &client,
+                                &base_url,
+                                &password,
+                                &session_id,
+                                &session.id,
+                                form,
+                                cancel.clone(),
+                            ).await.map_err(OpenCodeRunFailure::new)? {
+                                return Ok(None);
+                            }
+                            empty_wait_completions = 0;
+                            awaiting_resume = true;
+                            resume_deadline = Some(
+                                tokio::time::Instant::now() + Duration::from_secs(30),
+                            );
+                            restart_opencode_wait_task(
+                                &mut wait_task,
+                                &mut session_idle,
+                                &client,
+                                &base_url,
+                                &password,
+                                &session_id,
                             );
                         }
                     }
@@ -3334,9 +3658,6 @@ async fn run_opencode_model(
                     if event_session_id != Some(session_id.as_str()) { continue; }
 
                     if event_type == "session.idle" {
-                        if generation_started {
-                            session_idle = true;
-                        }
                         continue;
                     }
                     if matches!(
@@ -3344,6 +3665,20 @@ async fn run_opencode_model(
                         "message.part.updated" | "message.part.delta" | "form.created" | "permission.asked"
                     ) {
                         generation_started = true;
+                    }
+                    if awaiting_resume
+                        && matches!(
+                            event_type,
+                            "message.part.updated"
+                                | "message.part.delta"
+                                | "form.created"
+                                | "permission.asked"
+                                | "session.status"
+                        )
+                    {
+                        awaiting_resume = false;
+                        resume_deadline = None;
+                        empty_wait_completions = 0;
                     }
                     if event_type == "session.error" {
                         run_error = Some(
@@ -3356,97 +3691,36 @@ async fn run_opencode_model(
                     }
                     if event_type == "form.created" {
                         let form = properties.get("form").unwrap_or(properties);
-                        let form_id = form["id"].as_str().ok_or_else(|| OpenCodeRunFailure::new(
-                            "OpenCode a envoyé un formulaire sans identifiant.".into()
-                        ))?;
-                        let fields = form["fields"].as_array().into_iter().flatten()
-                            .collect::<Vec<_>>();
-                        let mut form_prompts = Vec::with_capacity(fields.len());
-                        let mut form_answer_metadata = Vec::with_capacity(fields.len());
-                        for field in &fields {
-                            let key = field["key"].as_str().ok_or_else(|| OpenCodeRunFailure::new(
-                                "OpenCode a envoyé une question sans identifiant de réponse.".into()
-                            ))?;
-                            let multiple = field["type"] == "multiselect";
-                            let option_values = field["options"].as_array().into_iter().flatten()
-                                .filter_map(|option| {
-                                    let label = option["label"].as_str()?;
-                                    let value = option["value"].as_str().unwrap_or(label);
-                                    Some((label.to_string(), value.to_string()))
-                                })
-                                .take(8)
-                                .collect::<Vec<_>>();
-                            let question_text = field["description"].as_str()
-                                .filter(|description| !description.trim().is_empty())
-                                .map(|description| format!("{}\n\n{description}", field["title"].as_str().unwrap_or("Question")))
-                                .unwrap_or_else(|| field["title"].as_str().unwrap_or("Question").to_string());
-                            form_prompts.push(UserQuestionPrompt {
-                                id: String::new(),
-                                question: question_text,
-                                options: option_values.iter().map(|(label, _)| label.clone()).collect(),
-                                multiple,
-                                required: field["required"].as_bool().unwrap_or(true),
-                            });
-                            form_answer_metadata.push((key.to_string(), option_values, multiple));
+                        let form_id = form["id"].as_str().unwrap_or_default().to_string();
+                        if form_id.is_empty() || !handled_forms.insert(form_id) {
+                            continue;
                         }
-                        if form_prompts.is_empty() {
-                            return Err(OpenCodeRunFailure::new(
-                                "OpenCode a envoyé un formulaire sans question.".into()
-                            ));
-                        }
-                        let answers = match request_user_questions(
+                        if !answer_opencode_form(
                             app,
                             state,
-                            &session.id,
-                            form_prompts,
-                            cancel.clone(),
-                        ).await {
-                            Ok(answers) => answers,
-                            Err(_error) if *cancel.borrow() => {
-                                let _ = opencode_api_json(
-                                    &client,
-                                    &base_url,
-                                    &password,
-                                    reqwest::Method::POST,
-                                    &format!("/api/session/{session_id}/interrupt"),
-                                    None,
-                                ).await;
-                                emit_chat_stopped(app, &session.id);
-                                return Ok(None);
-                            }
-                            Err(error) => return Err(OpenCodeRunFailure::new(error)),
-                        };
-                        let mut form_answers = Map::new();
-                        for ((key, option_values, multiple), answer_value) in
-                            form_answer_metadata.into_iter().zip(answers)
-                        {
-                            let answer_value = if multiple {
-                                Value::Array(
-                                    answer_value.as_array().into_iter().flatten().map(|answer| {
-                                        let selected = answer.as_str().unwrap_or_default();
-                                        Value::String(option_values.iter()
-                                            .find(|(label, _)| label == selected)
-                                            .map(|(_, value)| value.clone())
-                                            .unwrap_or_else(|| selected.to_string()))
-                                    }).collect()
-                                )
-                            } else {
-                                let selected = answer_value.as_str().unwrap_or_default();
-                                Value::String(option_values.iter()
-                                    .find(|(label, _)| label == selected)
-                                    .map(|(_, value)| value.clone())
-                                    .unwrap_or_else(|| selected.to_string()))
-                            };
-                            form_answers.insert(key, answer_value);
-                        }
-                        opencode_api_json(
                             &client,
                             &base_url,
                             &password,
-                            reqwest::Method::POST,
-                            &format!("/api/session/{session_id}/form/{form_id}/reply"),
-                            Some(serde_json::json!({ "answer": form_answers })),
-                        ).await.map_err(OpenCodeRunFailure::new)?;
+                            &session_id,
+                            &session.id,
+                            form,
+                            cancel.clone(),
+                        ).await.map_err(OpenCodeRunFailure::new)? {
+                            return Ok(None);
+                        }
+                        empty_wait_completions = 0;
+                        awaiting_resume = true;
+                        resume_deadline = Some(
+                            tokio::time::Instant::now() + Duration::from_secs(30),
+                        );
+                        restart_opencode_wait_task(
+                            &mut wait_task,
+                            &mut session_idle,
+                            &client,
+                            &base_url,
+                            &password,
+                            &session_id,
+                        );
                         continue;
                     }
                     if event_type == "permission.asked" {
@@ -3500,9 +3774,22 @@ async fn run_opencode_model(
                                 "decision": if approved { if allow_all { "always" } else { "once" } } else { "reject" }
                             })),
                         ).await.map_err(OpenCodeRunFailure::new)?;
+                        if let Some(wait_task) = wait_task.take() {
+                            wait_task.abort();
+                        }
+                        session_idle = false;
+                        wait_task = Some(start_opencode_wait_task(
+                            client.clone(),
+                            base_url.clone(),
+                            password.clone(),
+                            session_id.clone(),
+                        ));
                         continue;
                     }
                     if let Some(text) = opencode_text_delta(&payload, &mut seen_text_parts) {
+                        awaiting_resume = false;
+                        resume_deadline = None;
+                        empty_wait_completions = 0;
                         emit_opencode_text_update(
                             app,
                             &session.id,
@@ -6028,6 +6315,52 @@ mod tests {
         assert_eq!(tool.name, "question");
         assert_eq!(tool.arguments["questions"][0]["question"], "Continuer ?");
         assert_eq!(tool.result, "done");
+    }
+
+    #[test]
+    fn maps_pending_opencode_forms_to_visible_single_and_multiple_questions() {
+        let (form_id, prompts, answers) = opencode_form_prompts(&serde_json::json!({
+            "id": "form-1",
+            "fields": [
+                {
+                    "key": "language",
+                    "type": "string",
+                    "title": "Langue",
+                    "description": "Choisis une langue.",
+                    "required": true,
+                    "options": [
+                        { "label": "Français", "value": "fr" },
+                        { "label": "Anglais", "value": "en" }
+                    ]
+                },
+                {
+                    "key": "features",
+                    "type": "multiselect",
+                    "title": "Fonctions",
+                    "required": false,
+                    "options": [
+                        { "label": "Recherche", "value": "search" }
+                    ]
+                },
+                {
+                    "key": "internal",
+                    "type": "string",
+                    "title": "Internal",
+                    "hidden": true
+                }
+            ]
+        }))
+        .unwrap();
+
+        assert_eq!(form_id, "form-1");
+        assert_eq!(prompts.len(), 2);
+        assert_eq!(prompts[0].question, "Langue\n\nChoisis une langue.");
+        assert_eq!(prompts[0].options, ["Français", "Anglais"]);
+        assert!(prompts[0].required);
+        assert!(prompts[1].multiple);
+        assert!(!prompts[1].required);
+        assert_eq!(answers[0].options[0], ("Français".into(), "fr".into()));
+        assert_eq!(answers[1].key, "features");
     }
 
     #[test]
