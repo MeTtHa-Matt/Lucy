@@ -1152,6 +1152,14 @@ fn is_opencode_question_tool(name: &str) -> bool {
     )
 }
 
+fn opencode_question_cache_key(question: &str) -> String {
+    question
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
 fn opencode_question_prompts(arguments: &Value) -> Vec<OpenCodeQuestion> {
     let prompts = arguments["questions"]
         .as_array()
@@ -4665,6 +4673,7 @@ async fn send_message(
         };
         let mut opencode_tools = Vec::new();
         let mut opencode_timeline = Vec::new();
+        let mut answered_questions: BTreeMap<String, Value> = BTreeMap::new();
         let mut question_rounds = 0;
         loop {
             let Some((answer, opencode_session_id, run_tools, mut run_timeline)) = run else {
@@ -4714,16 +4723,24 @@ async fn send_message(
                 }
                 let mut answers = Vec::with_capacity(questions.len());
                 for question in questions {
-                    let answer = request_user_answer(
-                        &app,
-                        &state,
-                        &session_id,
-                        &question.question,
-                        question.options,
-                        false,
-                        cancel.clone(),
-                    )
-                    .await?;
+                    let question_key = opencode_question_cache_key(&question.question);
+                    let answer = match answered_questions.get(&question_key) {
+                        Some(answer) => answer.clone(),
+                        None => {
+                            let answer = request_user_answer(
+                                &app,
+                                &state,
+                                &session_id,
+                                &question.question,
+                                question.options,
+                                false,
+                                cancel.clone(),
+                            )
+                            .await?;
+                            answered_questions.insert(question_key, answer.clone());
+                            answer
+                        }
+                    };
                     answers.push((question.question, answer));
                 }
                 let answer_summary = answers
@@ -6117,6 +6134,14 @@ mod tests {
         assert!(is_opencode_question_tool("question"));
         assert!(is_opencode_question_tool("functions.question"));
         assert!(!is_opencode_question_tool("bash"));
+    }
+
+    #[test]
+    fn opencode_question_cache_key_ignores_case_and_extra_whitespace() {
+        assert_eq!(
+            opencode_question_cache_key("  Quelle  option\n préfères-tu ? "),
+            opencode_question_cache_key("quelle option préfères-tu ?")
+        );
     }
 
     #[test]
