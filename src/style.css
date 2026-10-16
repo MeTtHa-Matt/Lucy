@@ -2972,7 +2972,7 @@ summary,
   50% { height: 14.4px; opacity: 1; }
 }
 
-.streaming-text::after {
+.streaming-text .markdown-body > :last-child::after {
   display: inline-block;
   width: 6px;
   height: 1em;
