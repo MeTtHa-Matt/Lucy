@@ -1100,6 +1100,18 @@ fn opencode_run_prompt(
     Ok(prompt)
 }
 
+fn opencode_question_continuation_prompt(
+    system_prompt: &str,
+    context_summary: Option<&str>,
+    chat_history: &[ChatMessage],
+) -> Result<String, String> {
+    let mut prompt = opencode_run_prompt(system_prompt, context_summary, chat_history, None)?;
+    prompt.push_str(
+        "\n\nReprends la demande initiale de l’utilisateur en tenant compte des réponses déjà données dans l’historique. Ne repose aucune question déjà répondue.",
+    );
+    Ok(prompt)
+}
+
 #[derive(Clone)]
 struct OpenCodeToolEvent {
     id: String,
@@ -2552,6 +2564,70 @@ fn append_session_message(
     session.messages.push(message);
     session.updated_at = now_millis();
     save_store(state, &store)
+}
+
+fn persist_opencode_timeline(
+    state: &AppState,
+    session_id: &str,
+    timeline: &[OpenCodeTimelineItem],
+    tools: &[OpenCodeToolEvent],
+) -> Result<Vec<ChatMessage>, String> {
+    let mut messages = Vec::new();
+    for item in timeline {
+        match item {
+            OpenCodeTimelineItem::Text(text) => messages.push(ChatMessage {
+                id: Uuid::new_v4().to_string(),
+                role: "assistant".into(),
+                text: text.clone(),
+                created_at: now_millis(),
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+                provider_metadata: Map::new(),
+            }),
+            OpenCodeTimelineItem::Tool(tool_id) => {
+                if let Some(tool) = tools
+                    .iter()
+                    .find(|tool| tool.id == *tool_id && !is_opencode_question_tool(&tool.name))
+                {
+                    let call = serde_json::json!({
+                        "id": tool.id,
+                        "type": "function",
+                        "function": {
+                            "name": tool.name,
+                            "arguments": serde_json::to_string(&tool.arguments)
+                                .unwrap_or_else(|_| "{}".into()),
+                        },
+                    });
+                    messages.push(ChatMessage {
+                        id: Uuid::new_v4().to_string(),
+                        role: "assistant".into(),
+                        text: String::new(),
+                        created_at: now_millis(),
+                        tool_calls: vec![call],
+                        tool_call_id: None,
+                        provider_metadata: Map::new(),
+                    });
+                    messages.push(ChatMessage {
+                        id: Uuid::new_v4().to_string(),
+                        role: "tool".into(),
+                        text: if tool.result.is_empty() && tool.status == "error" {
+                            "L’outil OpenCode a échoué.".into()
+                        } else {
+                            tool.result.clone()
+                        },
+                        created_at: now_millis(),
+                        tool_calls: Vec::new(),
+                        tool_call_id: Some(tool.id.clone()),
+                        provider_metadata: Map::new(),
+                    });
+                }
+            }
+        }
+    }
+    for message in &messages {
+        append_session_message(state, session_id, message.clone())?;
+    }
+    Ok(messages)
 }
 
 fn record_context_usage(
@@ -4718,7 +4794,15 @@ async fn send_message(
                 return Err("OpenCode a dépassé la limite de questions interactives.".into());
             }
             question_rounds += 1;
-            let mut continuations = Vec::new();
+            let completed_messages = persist_opencode_timeline(
+                &state,
+                &session_id,
+                &opencode_timeline,
+                &opencode_tools,
+            )?;
+            chat_history.extend(completed_messages);
+            opencode_timeline.clear();
+            opencode_tools.clear();
             for question_call in question_calls {
                 let questions = opencode_question_prompts(&question_call.arguments);
                 if questions.is_empty() {
@@ -4790,19 +4874,34 @@ async fn send_message(
                     tool_call_id: Some(question_call.id),
                     provider_metadata: Map::new(),
                 };
-                continuations.push(question_result.text.clone());
                 append_session_message(&state, &session_id, question_result.clone())?;
                 chat_history.push(question_result);
             }
 
-            let follow_up = format!(
-                "{}\n\nReprends la demande initiale de l’utilisateur en tenant compte de ces réponses. Ne repose pas les mêmes questions.",
-                continuations.join("\n")
-            );
+            {
+                let mut store = state
+                    .store
+                    .lock()
+                    .map_err(|_| "Impossible d’accéder aux données LUCY.".to_string())?;
+                let stored_session = store
+                    .sessions
+                    .iter_mut()
+                    .find(|stored_session| stored_session.id == session_id)
+                    .ok_or_else(|| "La session LUCY n’existe plus.".to_string())?;
+                stored_session.opencode_session_id = None;
+                session.opencode_session_id = None;
+                save_store(&state, &store)?;
+            }
+            let follow_up = opencode_question_continuation_prompt(
+                &system_prompt,
+                session.context_summary.as_deref(),
+                &chat_history,
+            )?;
+            let fresh_session = session.clone();
             run = run_opencode_model(
                 &app,
                 &state,
-                &session,
+                &fresh_session,
                 &request_model_id,
                 &assistant_id,
                 &follow_up,
@@ -4811,68 +4910,7 @@ async fn send_message(
             .await
             .map_err(|failure| failure.message)?;
         }
-        for item in opencode_timeline {
-            match item {
-                OpenCodeTimelineItem::Text(text) => {
-                    let message = ChatMessage {
-                        id: Uuid::new_v4().to_string(),
-                        role: "assistant".into(),
-                        text,
-                        created_at: now_millis(),
-                        tool_calls: Vec::new(),
-                        tool_call_id: None,
-                        provider_metadata: Map::new(),
-                    };
-                    append_session_message(&state, &session_id, message)?;
-                }
-                OpenCodeTimelineItem::Tool(tool_id) => {
-                    if let Some(tool) = opencode_tools
-                        .iter()
-                        .find(|tool| tool.id == tool_id && !is_opencode_question_tool(&tool.name))
-                    {
-                        let call = serde_json::json!({
-                            "id": tool.id,
-                            "type": "function",
-                            "function": {
-                                "name": tool.name,
-                                "arguments": serde_json::to_string(&tool.arguments)
-                                    .unwrap_or_else(|_| "{}".into()),
-                            },
-                        });
-                        append_session_message(
-                            &state,
-                            &session_id,
-                            ChatMessage {
-                                id: Uuid::new_v4().to_string(),
-                                role: "assistant".into(),
-                                text: String::new(),
-                                created_at: now_millis(),
-                                tool_calls: vec![call],
-                                tool_call_id: None,
-                                provider_metadata: Map::new(),
-                            },
-                        )?;
-                        append_session_message(
-                            &state,
-                            &session_id,
-                            ChatMessage {
-                                id: Uuid::new_v4().to_string(),
-                                role: "tool".into(),
-                                text: if tool.result.is_empty() && tool.status == "error" {
-                                    "L’outil OpenCode a échoué.".into()
-                                } else {
-                                    tool.result.clone()
-                                },
-                                created_at: now_millis(),
-                                tool_calls: Vec::new(),
-                                tool_call_id: Some(tool.id.clone()),
-                                provider_metadata: Map::new(),
-                            },
-                        )?;
-                    }
-                }
-            }
-        }
+        persist_opencode_timeline(&state, &session_id, &opencode_timeline, &opencode_tools)?;
         let _ = app.emit(
             CHAT_UPDATE,
             ChatUpdate {
@@ -6190,6 +6228,50 @@ mod tests {
             opencode_question_cache_key("  Quelle  option\n préfères-tu ? "),
             opencode_question_cache_key("quelle option préfères-tu ?")
         );
+    }
+
+    #[test]
+    fn opencode_question_continuation_replays_the_answer_in_a_fresh_context() {
+        let history = vec![
+            ChatMessage {
+                id: "user".into(),
+                role: "user".into(),
+                text: "Prépare le projet".into(),
+                created_at: 1,
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+                provider_metadata: Map::new(),
+            },
+            ChatMessage {
+                id: "question".into(),
+                role: "assistant".into(),
+                text: String::new(),
+                created_at: 2,
+                tool_calls: vec![serde_json::json!({
+                    "id": "call-question",
+                    "type": "function",
+                    "function": {
+                        "name": "question",
+                        "arguments": "{\"question\":\"Quel langage ?\"}",
+                    },
+                })],
+                tool_call_id: None,
+                provider_metadata: Map::new(),
+            },
+            ChatMessage {
+                id: "answer".into(),
+                role: "tool".into(),
+                text: "Réponses de l’utilisateur :\n1. Quel langage ? : Rust".into(),
+                created_at: 3,
+                tool_calls: Vec::new(),
+                tool_call_id: Some("call-question".into()),
+                provider_metadata: Map::new(),
+            },
+        ];
+
+        let prompt = opencode_question_continuation_prompt("Instructions", None, &history).unwrap();
+        assert!(prompt.contains("Quel langage ? : Rust"));
+        assert!(prompt.contains("Ne repose aucune question déjà répondue."));
     }
 
     #[test]
