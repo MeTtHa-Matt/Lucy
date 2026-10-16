@@ -734,7 +734,12 @@ fn compaction_boundary(history: &[ChatMessage], keep_recent_tokens: usize) -> Op
         .rev()
         .find(|index| history[*index].role == "user")
         .or_else(|| (keep_start..history.len()).find(|index| history[*index].role == "user"))
-        .unwrap_or(keep_start);
+        .filter(|index| *index > 0)
+        .or_else(|| {
+            (1..=keep_start).rev().find(|index| {
+                history[*index].role == "assistant" && !history[*index].tool_calls.is_empty()
+            })
+        })?;
     (boundary > 0 && boundary < history.len()).then_some(boundary)
 }
 
@@ -4881,29 +4886,6 @@ async fn send_message(
         );
         return Ok(());
     }
-    if estimated_tokens > CONTEXT_COMPACTION_THRESHOLD_TOKENS {
-        let compacted = compact_chat_history(
-            &app,
-            &state,
-            &client,
-            &provider,
-            &request_model_id,
-            &session_id,
-            &mut session,
-            &mut chat_history,
-            CONTEXT_COMPACTION_KEEP_TOKENS,
-            &mut cancel,
-        )
-        .await;
-        match compacted {
-            Ok(_) => {}
-            Err(_) if *cancel.borrow() => {
-                emit_chat_stopped(&app, &session_id);
-                return Ok(());
-            }
-            Err(error) => return Err(error),
-        }
-    }
     let final_answer;
     let mut tool_rounds = 0;
     let mut continuations = 0;
@@ -4919,6 +4901,42 @@ async fn send_message(
                 "role": "user",
                 "content": "La réponse précédente a été interrompue par la limite de sortie du modèle. Reprends directement à la suite, sans répéter ce qui a déjà été dit."
             }));
+        }
+        if request_token_estimate(&chat_messages, &tool_definitions)
+            > CONTEXT_COMPACTION_THRESHOLD_TOKENS
+        {
+            let compacted = compact_chat_history(
+                &app,
+                &state,
+                &client,
+                &provider,
+                &request_model_id,
+                &session_id,
+                &mut session,
+                &mut chat_history,
+                CONTEXT_COMPACTION_KEEP_TOKENS,
+                &mut cancel,
+            )
+            .await;
+            match compacted {
+                Ok(_) => {}
+                Err(_) if *cancel.borrow() => {
+                    emit_chat_stopped(&app, &session_id);
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
+            }
+            chat_messages = chat_messages_for_request(
+                &system_prompt,
+                session.context_summary.as_deref(),
+                &chat_history,
+            );
+            if continuations > 0 {
+                chat_messages.push(serde_json::json!({
+                    "role": "user",
+                    "content": "La réponse précédente a été interrompue par la limite de sortie du modèle. Reprends directement à la suite, sans répéter ce qui a déjà été dit."
+                }));
+            }
         }
         let url = format!(
             "{}/chat/completions",
@@ -5800,6 +5818,36 @@ mod tests {
         );
         assert_eq!(restored.context_summary_message_count, boundary);
         assert_eq!(restored.context_usage.unwrap().used_tokens, 1_200);
+    }
+
+    #[test]
+    fn compaction_can_summarize_completed_tool_rounds_within_one_user_turn() {
+        let tool_call = serde_json::json!({
+            "id": "call",
+            "type": "function",
+            "function": { "name": "read_file", "arguments": "{}" },
+        });
+        let message = |role: &str, text: &str, tool_calls: Vec<Value>| ChatMessage {
+            id: Uuid::new_v4().to_string(),
+            role: role.into(),
+            text: text.into(),
+            created_at: now_millis(),
+            tool_calls,
+            tool_call_id: None,
+            provider_metadata: Map::new(),
+        };
+        let history = vec![
+            message("user", "Analyse ce projet", Vec::new()),
+            message("assistant", "", vec![tool_call.clone()]),
+            message("tool", &"ancien résultat ".repeat(100), Vec::new()),
+            message("assistant", "", vec![tool_call]),
+            message("tool", "résultat récent", Vec::new()),
+        ];
+
+        let boundary = compaction_boundary(&history, 8).unwrap();
+        assert_eq!(boundary, 3);
+        assert_eq!(history[boundary].role, "assistant");
+        assert!(!history[boundary].tool_calls.is_empty());
     }
 
     #[test]
