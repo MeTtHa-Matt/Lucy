@@ -1213,6 +1213,25 @@ fn opencode_question_prompts(arguments: &Value) -> Vec<OpenCodeQuestion> {
         .collect()
 }
 
+fn unanswered_opencode_question_calls(
+    tools: &[OpenCodeToolEvent],
+    answered_questions: &BTreeMap<String, Value>,
+) -> Vec<OpenCodeToolEvent> {
+    tools
+        .iter()
+        .filter(|tool| is_opencode_question_tool(&tool.name))
+        .filter(|tool| {
+            let questions = opencode_question_prompts(&tool.arguments);
+            questions.is_empty()
+                || questions.iter().any(|question| {
+                    !answered_questions
+                        .contains_key(&opencode_question_cache_key(&question.question))
+                })
+        })
+        .cloned()
+        .collect()
+}
+
 fn append_opencode_text(timeline: &mut Vec<OpenCodeTimelineItem>, text: &str) {
     if let Some(OpenCodeTimelineItem::Text(previous)) = timeline.last_mut() {
         previous.push_str(text);
@@ -2838,9 +2857,14 @@ async fn answer_opencode_form(
     opencode_session_id: &str,
     lucy_session_id: &str,
     form: &Value,
+    answered_questions: &mut BTreeMap<String, Value>,
     cancel: watch::Receiver<bool>,
 ) -> Result<bool, String> {
     let (form_id, prompts, answer_metadata) = opencode_form_prompts(form)?;
+    let question_keys = prompts
+        .iter()
+        .map(|prompt| opencode_question_cache_key(&prompt.question))
+        .collect::<Vec<_>>();
     let answers =
         match request_user_questions(app, state, lucy_session_id, prompts, cancel.clone()).await {
             Ok(answers) => answers,
@@ -2860,7 +2884,7 @@ async fn answer_opencode_form(
             Err(error) => return Err(error),
         };
     let mut form_answers = Map::new();
-    for (metadata, answer) in answer_metadata.into_iter().zip(answers) {
+    for (metadata, answer) in answer_metadata.into_iter().zip(&answers) {
         let value = if metadata.multiple {
             Value::Array(
                 answer
@@ -2893,6 +2917,7 @@ async fn answer_opencode_form(
         };
         form_answers.insert(metadata.key, value);
     }
+    answered_questions.extend(question_keys.into_iter().zip(answers));
     opencode_api_json(
         client,
         base_url,
@@ -3252,6 +3277,7 @@ async fn run_opencode_model(
     model_id: &str,
     assistant_id: &str,
     prompt: &str,
+    answered_questions: &mut BTreeMap<String, Value>,
     cancel: &mut watch::Receiver<bool>,
 ) -> Result<
     Option<(
@@ -3551,6 +3577,7 @@ async fn run_opencode_model(
                                         &session_id,
                                         &session.id,
                                         form,
+                                        answered_questions,
                                         cancel.clone(),
                                     ).await.map_err(OpenCodeRunFailure::new)? {
                                         return Ok(None);
@@ -3692,6 +3719,7 @@ async fn run_opencode_model(
                                 &session_id,
                                 &session.id,
                                 form,
+                                answered_questions,
                                 cancel.clone(),
                             ).await.map_err(OpenCodeRunFailure::new)? {
                                 return Ok(None);
@@ -3793,6 +3821,7 @@ async fn run_opencode_model(
                             &session_id,
                             &session.id,
                             form,
+                            answered_questions,
                             cancel.clone(),
                         ).await.map_err(OpenCodeRunFailure::new)? {
                             return Ok(None);
@@ -4698,6 +4727,7 @@ async fn send_message(
             &chat_history,
             session.opencode_session_id.as_deref(),
         )?;
+        let mut answered_questions: BTreeMap<String, Value> = BTreeMap::new();
         let run = run_opencode_model(
             &app,
             &state,
@@ -4705,6 +4735,7 @@ async fn send_message(
             &request_model_id,
             &assistant_id,
             &prompt,
+            &mut answered_questions,
             &mut cancel,
         )
         .await;
@@ -4739,6 +4770,7 @@ async fn send_message(
                     &request_model_id,
                     &assistant_id,
                     &fresh_prompt,
+                    &mut answered_questions,
                     &mut cancel,
                 )
                 .await
@@ -4754,7 +4786,6 @@ async fn send_message(
         };
         let mut opencode_tools = Vec::new();
         let mut opencode_timeline = Vec::new();
-        let mut answered_questions: BTreeMap<String, Value> = BTreeMap::new();
         let mut question_rounds = 0;
         loop {
             let Some((answer, opencode_session_id, run_tools, mut run_timeline)) = run else {
@@ -4776,11 +4807,8 @@ async fn send_message(
                 save_store(&state, &store)?;
             }
 
-            let question_calls = run_tools
-                .iter()
-                .filter(|tool| is_opencode_question_tool(&tool.name))
-                .cloned()
-                .collect::<Vec<_>>();
+            let question_calls =
+                unanswered_opencode_question_calls(&run_tools, &answered_questions);
             opencode_timeline.extend(run_timeline);
             opencode_tools.extend(
                 run_tools
@@ -4905,6 +4933,7 @@ async fn send_message(
                 &request_model_id,
                 &assistant_id,
                 &follow_up,
+                &mut answered_questions,
                 &mut cancel,
             )
             .await
@@ -6228,6 +6257,47 @@ mod tests {
             opencode_question_cache_key("  Quelle  option\n préfères-tu ? "),
             opencode_question_cache_key("quelle option préfères-tu ?")
         );
+    }
+
+    #[test]
+    fn skips_question_tool_calls_already_answered_through_native_forms() {
+        let form = serde_json::json!({
+            "id": "form-1",
+            "fields": [{
+                "key": "language",
+                "title": "Langage",
+                "description": "Quel langage préfères-tu ?",
+                "options": [
+                    { "label": "Rust", "value": "rust" },
+                    { "label": "Python", "value": "python" },
+                ],
+            }],
+        });
+        let (_, prompts, _) = opencode_form_prompts(&form).unwrap();
+        let tools = vec![OpenCodeToolEvent {
+            id: "question-call".into(),
+            name: "question".into(),
+            arguments: serde_json::json!({
+                "questions": [{
+                    "header": "Langage",
+                    "question": "Quel langage préfères-tu ?",
+                    "options": ["Rust", "Python"],
+                }],
+            }),
+            status: "completed".into(),
+            result: "Rust".into(),
+        }];
+        let answered = prompts
+            .into_iter()
+            .map(|prompt| {
+                (
+                    opencode_question_cache_key(&prompt.question),
+                    Value::String("Rust".into()),
+                )
+            })
+            .collect();
+
+        assert!(unanswered_opencode_question_calls(&tools, &answered).is_empty());
     }
 
     #[test]
